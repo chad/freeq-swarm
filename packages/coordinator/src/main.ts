@@ -20,6 +20,7 @@ import {
 } from '@freeq-swarm/shared';
 import { CoordinatorDb } from './db.js';
 import { defaultRestBase, fetchBudget, issueBudget } from './budget.js';
+import { handleInboundPrivmsg } from './dispatcher.js';
 
 export interface CoordinatorOptions {
   /** Override config path. Defaults to `~/.freeq-swarm/coordinator/coordinator.yaml`. */
@@ -119,7 +120,15 @@ export async function main(opts: CoordinatorOptions = {}): Promise<void> {
     }
   }, 5000);
 
-  // ── 10. Clean shutdown ──
+  // ── 10. Wire inbound PRIVMSG handler (Phase 2 ingestion) ──
+  conn.client.on('message', (channel, m) => {
+    void handleInboundPrivmsg(
+      { client: conn.client, db, config, didCache },
+      { target: channel, from: m.from ?? '', text: m.text ?? '' },
+    );
+  });
+
+  // ── 11. Clean shutdown ──
   const shutdown = async (sig: string): Promise<void> => {
     console.log(`shutdown: ${sig}`);
     await handle.stop(`coordinator ${sig}`);
