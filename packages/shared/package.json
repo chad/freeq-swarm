@@ -16,7 +16,12 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
+    "@freeq/sdk": "file:../../../freeq/freeq-sdk-js",
+    "js-yaml": "^4.1.0",
     "ulid": "^2.3.0",
     "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/js-yaml": "^4.0.9"
   }
 }

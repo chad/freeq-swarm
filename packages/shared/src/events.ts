@@ -43,16 +43,6 @@ export const PresenceState = z.enum([
 ]);
 export type PresenceState = z.infer<typeof PresenceState>;
 
-export const GovernanceSignal = z.enum([
-  'pause',
-  'resume',
-  'revoke',
-  'approval_granted',
-  'approval_denied',
-  'budget_exceeded',
-]);
-export type GovernanceSignal = z.infer<typeof GovernanceSignal>;
-
 // ── §5.1 Capability advertisement ───────────────────────────────────────────
 
 export const CapabilityModel = z.object({

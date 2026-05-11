@@ -12,6 +12,7 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
-    "@freeq-swarm/shared": "workspace:*"
+    "@freeq-swarm/shared": "workspace:*",
+    "@freeq/sdk": "file:../../../freeq/freeq-sdk-js"
   }
 }

@@ -12,6 +12,11 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
-    "@freeq-swarm/shared": "workspace:*"
+    "@freeq-swarm/shared": "workspace:*",
+    "@freeq/sdk": "file:../../../freeq/freeq-sdk-js",
+    "better-sqlite3": "^11.7.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.12"
   }
 }
