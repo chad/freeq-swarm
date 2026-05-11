@@ -46,6 +46,11 @@ export interface DispatchHandle {
   flushAll(): void;
   /** Cancel all pending claim-window timers. */
   shutdown(): void;
+  /**
+   * Boot-time recovery: rebuild in-memory timers for any in-flight task
+   * found in SQLite. PLAN §3.1 recovery scan. Idempotent.
+   */
+  recover(now?: Date): void;
 }
 
 interface PendingTask {
@@ -398,7 +403,67 @@ export function createDispatcher(deps: DispatchDeps): DispatchHandle {
     executing.clear();
   }
 
-  return { handle, flushAll, shutdown };
+  /** Boot-time recovery: walks `tasks` rows that are not in a terminal state
+   *  and rebuilds the appropriate timer / runs synchronous finalize.
+   *
+   *  PLAN §3.1 recovery state machine:
+   *    pending_claims:
+   *      now - created_at < claim_window_ms  → re-arm timer for remaining
+   *      else if claims arrived              → assign now
+   *      else                                → fail no_claims
+   *    assigned / verifying:
+   *      now - assigned_at < execution_timeout_ms → re-arm exec timer
+   *      else                                       → finalize what's in
+   */
+  function recover(now: Date = new Date()): void {
+    const nowSec = Math.floor(now.getTime() / 1000);
+    for (const t of deps.db.inFlightTasks()) {
+      const payload = JSON.parse(t.payload_json) as any;
+      const claimWindowMs = payload.policy.claim_window_ms as number;
+      const execTimeoutMs = payload.policy.execution_timeout_ms as number;
+      const reviewersNeeded = payload.policy.reviewers_needed as number;
+
+      if (t.state === 'pending_claims') {
+        const elapsedMs = (nowSec - t.created_at) * 1000;
+        if (elapsedMs < claimWindowMs) {
+          if (pending.has(t.task_id)) continue;
+          const remainingMs = Math.max(claimWindowMs - elapsedMs, 0);
+          const timer = sched.setTimeout(() => assignFromCollected(t.task_id), remainingMs);
+          pending.set(t.task_id, { taskId: t.task_id, reviewersNeeded, timer });
+        } else {
+          // Window already expired; let assignFromCollected dispatch or fail.
+          if (pending.has(t.task_id)) continue;
+          // Use a degenerate timer that fires synchronously so existing
+          // semantics hold (assignFromCollected pulls from `pending`).
+          const timer = sched.setTimeout(() => assignFromCollected(t.task_id), 0);
+          pending.set(t.task_id, { taskId: t.task_id, reviewersNeeded, timer });
+        }
+        continue;
+      }
+
+      if (t.state === 'assigned' || t.state === 'verifying') {
+        if (executing.has(t.task_id)) continue;
+        const startedAt = t.assigned_at ?? t.created_at;
+        const deadlineSec = startedAt + Math.floor(execTimeoutMs / 1000);
+        const remainingMs = Math.max((deadlineSec - nowSec) * 1000, 0);
+        if (remainingMs > 0) {
+          const timer = sched.setTimeout(() => onExecutionTimeout(t.task_id), remainingMs);
+          executing.set(t.task_id, {
+            taskId: t.task_id,
+            reviewersNeeded,
+            startedAt,
+            timer,
+          });
+        } else {
+          // Past deadline; finalize on whatever evidence is in (or
+          // fall through to retry-on-timeout policy).
+          onExecutionTimeout(t.task_id);
+        }
+      }
+    }
+  }
+
+  return { handle, flushAll, shutdown, recover };
 }
 
 function tieBreak(taskId: string, workerDid: string): string {

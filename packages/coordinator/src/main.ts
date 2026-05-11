@@ -139,6 +139,10 @@ export async function main(opts: CoordinatorOptions = {}): Promise<void> {
     didCache,
     operatorAllowlist: config.operator_allowlist,
   });
+  // Recovery: re-arm timers for any in-flight tasks left over from a previous
+  // run BEFORE we wire inbound handlers, so the recovery decisions aren't
+  // raced by fresh events.
+  dispatcher.recover();
   const unsubEvents = subscribeCoordinationEvents(conn.client, (evt) => {
     dispatcher.handle(evt);
   });

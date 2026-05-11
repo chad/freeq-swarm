@@ -117,17 +117,40 @@ describe('EDGE: SQLite persistence', () => {
 // ─────────────────────────────────────────────────────────────────────────────
 
 describe('EDGE: recovery (Phase 5 plan §3.1)', () => {
-  it('BB1: re-creating dispatcher with pre-existing assigned task picks up where it left off', () => {
+  it('BB1: dispatcher.recover() arms exec timer for pre-existing assigned task', () => {
     const db = new CoordinatorDb(':memory:');
-    seedTask(db, 'BB1', 1, 'assigned');
+    // Pre-seed an assigned task to a worker (simulating coordinator restart
+    // mid-execution).
+    db.insertTask({
+      task_id: 'BB1',
+      state: 'assigned',
+      task_type: 'pr_review',
+      requester_did: 'did:plc:r',
+      payload_json: JSON.stringify({
+        kind: 'swarm.task/v1',
+        task_type: 'pr_review',
+        requester_did: 'did:plc:r',
+        target: { repo: 'github.com/foo/bar', pr: 1, head_sha: 'a' },
+        spec: { diff_url: 'x' },
+        policy: {
+          reviewers_needed: 1,
+          claim_window_ms: 30000,
+          execution_timeout_ms: 300000,
+          max_usd_per_reviewer: 1.5,
+        },
+      }),
+      created_at: 1000,
+      retries_remaining: 1,
+    });
     db.recordAssignment('BB1', 'did:key:a', 1000);
-    // Insert evidence after "restart"
     const c = makeClient();
     const sched = fakeScheduler();
     const cache = workerCache('did:key:a');
     const d = createDispatcher({ client: c.client, db, channel: '#swarm', scheduler: sched.api, didCache: cache });
-    // Worker posts evidence — dispatcher should treat task as in-flight even
-    // though we never saw the original task_request in this dispatcher instance.
+    // Recovery should arm an execution timer.
+    d.recover(new Date(1100 * 1000)); // 100s after assignment
+    expect(sched.cbs.length).toBe(1);
+    // Now the worker posts late evidence — finalize should run.
     d.handle(inbound('evidence_attach', 'E1', srcFor('did:key:a'), {
       kind: 'swarm.review/v1',
       evidence_type: 'code_review',
@@ -143,14 +166,41 @@ describe('EDGE: recovery (Phase 5 plan §3.1)', () => {
       model: 'm',
       via: 'api',
     }, 'BB1'));
-    // Currently we don't know if dispatcher wires up an executing-timer for
-    // pre-existing assigned tasks at construction time. Document current
-    // behavior: evidence is INSERTED but maybeFinalize doesn't fire because
-    // there's no entry in `executing` map.
-    expect(db.evidenceFor('BB1')).toHaveLength(1);
-    expect(db.getTask('BB1')!.state).toBe('assigned'); // still!
-    // This is a real follow-up: dispatcher constructor should arm exec timers
-    // for pre-existing assigned tasks. Filed as edge case BB1.
+    expect(db.getTask('BB1')!.state).toBe('complete');
+  });
+
+  it('BB1b: recover() on pending_claims past its window assigns or fails', () => {
+    const db = new CoordinatorDb(':memory:');
+    // Create a pending_claims task whose claim window expired long ago
+    db.insertTask({
+      task_id: 'BB1b',
+      state: 'pending_claims',
+      task_type: 'pr_review',
+      requester_did: 'did:plc:r',
+      payload_json: JSON.stringify({
+        kind: 'swarm.task/v1',
+        task_type: 'pr_review',
+        requester_did: 'did:plc:r',
+        target: { repo: 'github.com/foo/bar', pr: 1, head_sha: 'a' },
+        spec: { diff_url: 'x' },
+        policy: {
+          reviewers_needed: 1,
+          claim_window_ms: 30000,
+          execution_timeout_ms: 300000,
+          max_usd_per_reviewer: 1.5,
+        },
+      }),
+      created_at: 100,
+      retries_remaining: 1,
+    });
+    const c = makeClient();
+    const sched = fakeScheduler();
+    const d = createDispatcher({ client: c.client, db, channel: '#swarm', scheduler: sched.api });
+    // Now is way past created_at + claim_window_ms.
+    d.recover(new Date(10_000_000));
+    sched.fireAll(); // synthetic 0-ms timer fires the assign-or-fail
+    expect(db.getTask('BB1b')!.state).toBe('failed');
+    expect(db.getTask('BB1b')!.failure_reason).toBe('no_claims');
   });
 
   it('BB2: clearClaims + clearAssignments cleanly reset task for re-dispatch', () => {
