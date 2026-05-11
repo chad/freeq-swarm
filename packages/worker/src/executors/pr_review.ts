@@ -183,6 +183,20 @@ export function truncateForWire<T extends Review>(payload: T): T {
   return { ...payload, comments: [], truncated: true };
 }
 
+/**
+ * Pre-execution cost estimate from the actual diff size. Worker uses this in
+ * Phase 4b to refuse with `task_failed :reason=budget_exceeded` before any
+ * spend is incurred.
+ */
+export function estimateReviewCostUsd(model: string, diffBytes: number): number {
+  const pricing = PRICING_DEFAULTS[model] ?? { in: 0, out: 0 };
+  const inputTokens = Math.ceil(diffBytes / 3.5);
+  return (
+    (inputTokens * pricing.in) / 1_000_000 +
+    (4096 * pricing.out) / 1_000_000
+  );
+}
+
 export async function runPrReview(input: PrReviewInput): Promise<Review> {
   const systemPrompt = await getSystemPrompt(input.systemPromptOverride);
   const userPrompt = buildUserPrompt(input.reviewFocus, input.diff);

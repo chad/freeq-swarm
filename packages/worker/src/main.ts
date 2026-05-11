@@ -20,8 +20,9 @@ import {
 import { buildCapabilityAdvertisement } from './capabilities.js';
 import { createWorkerClaimer, type WorkerPresenceState } from './claim.js';
 import { fetchPinnedDiff } from './diff.js';
-import { runPrReview } from './executors/pr_review.js';
+import { estimateReviewCostUsd, runPrReview } from './executors/pr_review.js';
 import { emitSpend } from './spend.js';
+import { attachGovernanceHandler, type GovernanceState } from './governance.js';
 import { EVENT_TYPES } from '@freeq-swarm/shared';
 
 export interface WorkerOptions {
@@ -133,25 +134,45 @@ export async function main(opts: WorkerOptions = {}): Promise<void> {
     }
   }, CAP_AD_INTERVAL_MS);
 
-  // ── 8. Wire the claimer to inbound coordination events ──
+  // ── 8. Governance handler (Phase 4b) ──
+  let govState: GovernanceState = 'normal';
+  const govHandle = attachGovernanceHandler({
+    client: conn.client,
+    nick: () => conn.nick,
+    setPresence: (s, extra) => setPresence(s as WorkerPresenceState, extra),
+    onStateChange: (s) => {
+      govState = s;
+      console.log(`governance: state=${s}`);
+    },
+    onRevoke: () => {
+      console.log('governance: revoked, exiting');
+      try {
+        conn.client.disconnect();
+      } catch {
+        /* gone */
+      }
+      process.exit(0);
+    },
+  });
+
+  // ── 9. Wire the claimer to inbound coordination events ──
   const claimer = createWorkerClaimer({
     client: conn.client,
     workerDid: identity.did,
     config,
     capability: cap,
-    channels: config.worker.swarm_channels,
+    // While paused / blocked / revoked, advertise no eligible channels so the
+    // claimer never claims (Phase 4b governance integration).
+    channels: govState === 'normal' ? config.worker.swarm_channels : [],
     getPresence: () => presence,
     getInFlight: () => inFlightTasks.size,
     onClaim: (taskId) => {
-      // Reserve the slot synchronously to close the race between accept and
-      // the assignment landing. PLAN F-15.
       inFlightTasks.add(taskId);
     },
   });
   const unsubEvents = subscribeCoordinationEvents(conn.client, (evt) => {
-    // Filter our own echoes (we don't claim our own task_request — we're a worker, not a coordinator,
-    // so this can only match if we're misconfigured. Defense in depth.).
-    claimer(evt);
+    // Don't accept new claims while not in normal governance state.
+    if (govState === 'normal') claimer(evt);
     // Detect assignment events naming us → transition to executing; otherwise release the slot.
     if (evt.eventType === 'task_update') {
       const a = evt.payload as any;
@@ -226,6 +247,17 @@ export async function main(opts: WorkerOptions = {}): Promise<void> {
       emitFailed(taskId, diffRes.reason, diffRes.detail ?? '');
       return;
     }
+    // Per-execution cost guard from actual diff bytes (Phase 4b).
+    const diffBytes = Buffer.byteLength(diffRes.diff, 'utf8');
+    const est = estimateReviewCostUsd(model.model, diffBytes);
+    if (est > config.constraints.max_usd_per_task) {
+      emitFailed(
+        taskId,
+        'budget_exceeded',
+        `est_usd ${est.toFixed(3)} > max_usd_per_task ${config.constraints.max_usd_per_task}`,
+      );
+      return;
+    }
     // Run review.
     for (const ch of channels) {
       const ev = buildCoordinationEvent(
@@ -275,6 +307,7 @@ export async function main(opts: WorkerOptions = {}): Promise<void> {
     console.log(`shutdown: ${sig}`);
     clearInterval(capAdTimer);
     unsubEvents();
+    govHandle.dispose();
     await handle.stop(`worker ${sig}`);
     process.exit(0);
   };
