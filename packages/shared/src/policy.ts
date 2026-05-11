@@ -30,7 +30,11 @@ export const CoordinatorConfig = z.object({
   }),
   summary: z.object({
     default_tz: z.string().default('UTC'),
-    default_time: z.string().regex(/^\d{2}:\d{2}$/).default('09:00'),
+    // HH:MM with HH ∈ [00,23] and MM ∈ [00,59] — strict, not just digit-shape.
+    default_time: z
+      .string()
+      .regex(/^([01]\d|2[0-3]):[0-5]\d$/)
+      .default('09:00'),
     per_requester_tz: z.record(z.string(), z.string()).default({}),
   }),
 });

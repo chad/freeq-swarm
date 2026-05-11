@@ -100,8 +100,17 @@ export function parseTaskCommand(body: string): ParseResult {
       };
     }
     if (k === 'reviewers') {
+      // Strict-decimal-integer: parseInt('1e30') → 1, which is dangerous;
+      // require the string itself to be only digits.
+      if (!/^\d{1,4}$/.test(v)) {
+        return {
+          ok: false,
+          reason: 'bad_flag_value',
+          detail: `reviewers must be a decimal integer in [1,16]; got '${v}'`,
+        };
+      }
       const n = Number.parseInt(v, 10);
-      if (!Number.isFinite(n) || n < 1 || n > 16) {
+      if (n < 1 || n > 16) {
         return {
           ok: false,
           reason: 'bad_flag_value',
