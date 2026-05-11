@@ -103,6 +103,10 @@ export function createDispatcher(deps: DispatchDeps): DispatchHandle {
   function onTaskRequest(evt: InboundCoordinationEvent): void {
     const t = deps.db.getTask(evt.eventId);
     if (!t) return; // we only dispatch tasks we created (own SQLite row exists)
+    // Replay defense: never re-arm a claim window for a task already in a
+    // terminal state, or one that's already mid-execution.
+    if (t.state === 'complete' || t.state === 'failed') return;
+    if (t.state === 'assigned' || t.state === 'verifying') return;
     const payload = JSON.parse(t.payload_json) as any;
     const reviewersNeeded = payload.policy.reviewers_needed as number;
     const claimWindowMs = payload.policy.claim_window_ms as number;
