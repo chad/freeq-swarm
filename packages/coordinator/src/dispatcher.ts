@@ -164,7 +164,12 @@ function emitTaskFailed(
 }
 
 function notice(client: FreeqClient, target: string, text: string): void {
-  client.raw(`NOTICE ${target} :${text}`);
+  // Sanitize CR/LF/NUL out of both target and text — without this, a payload
+  // like "...\r\nKICK #ch victim" would let the attacker inject arbitrary
+  // IRC commands through any error-path NOTICE we send.
+  const safeTarget = target.replace(/[\r\n\0 ]/g, '');
+  const safeText = text.replace(/[\r\n\0]/g, ' ');
+  client.raw(`NOTICE ${safeTarget} :${safeText}`);
 }
 
 function stripGitHubPrefix(repo: string): string {

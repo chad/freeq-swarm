@@ -5,15 +5,20 @@
 // PLAN §5.5, §5.6, F-15.
 import { createHash } from 'node:crypto';
 import {
+  type DidCache,
   type InboundCoordinationEvent,
   type Severity,
   type Verdict,
   EVENT_TYPES,
   buildCoordinationEvent,
+  nickFromSource,
 } from '@freeq-swarm/shared';
 import type { FreeqClient } from '@freeq/sdk';
 import type { CoordinatorDb } from './db.js';
 import { type ReviewSummary, computeConsensus } from './verify.js';
+
+/** Cap on stored evidence payload (defense against memory-amp attacks). */
+const MAX_EVIDENCE_PAYLOAD_BYTES = 16 * 1024;
 
 export interface DispatchDeps {
   client: FreeqClient;
@@ -21,6 +26,17 @@ export interface DispatchDeps {
   channel: string;
   /** Test hook: replace setTimeout/clearTimeout. */
   scheduler?: { setTimeout: typeof setTimeout; clearTimeout: typeof clearTimeout };
+  /**
+   * Required for sender-DID verification on task_accept / evidence_attach.
+   * If absent, dispatcher rejects all such events to avoid impersonation.
+   */
+  didCache?: DidCache;
+  /**
+   * Operator-DID allowlist. Workers whose advertised operator_did (from the
+   * capabilities table) is not in this list are silently dropped. If
+   * undefined, the allowlist check is skipped (test mode).
+   */
+  operatorAllowlist?: readonly string[];
 }
 
 export interface DispatchHandle {
@@ -59,6 +75,29 @@ export function createDispatcher(deps: DispatchDeps): DispatchHandle {
     else if (evt.eventType === EVENT_TYPES.task_accept) onTaskAccept(evt);
     else if (evt.eventType === EVENT_TYPES.evidence_attach) onEvidence(evt);
     else if (evt.eventType === EVENT_TYPES.task_failed) onWorkerFailure(evt);
+    else if (evt.eventType === EVENT_TYPES.status_update) onStatusUpdate(evt);
+  }
+
+  /**
+   * Capture capability advertisements published by workers. These power the
+   * operator-DID allowlist gate at task_accept time.
+   */
+  function onStatusUpdate(evt: InboundCoordinationEvent): void {
+    const payload = evt.payload as any;
+    if (payload?.kind !== 'swarm.capabilities/v1') return;
+    const workerDid = payload.worker_did;
+    const operatorDid = payload.operator_did;
+    if (typeof workerDid !== 'string' || typeof operatorDid !== 'string') return;
+    // Verify the source DID matches the advertised worker_did so a malicious
+    // user can't forge a cap ad for a victim DID.
+    const senderDid = resolveSenderDid(evt);
+    if (senderDid && senderDid !== workerDid) return;
+    deps.db.upsertCapability({
+      worker_did: workerDid,
+      operator_did: operatorDid,
+      payload_json: JSON.stringify(payload),
+      updated_at: Math.floor(Date.now() / 1000),
+    });
   }
 
   function onTaskRequest(evt: InboundCoordinationEvent): void {
@@ -79,8 +118,23 @@ export function createDispatcher(deps: DispatchDeps): DispatchHandle {
     const claim = evt.payload as any;
     const workerDid = claim?.worker_did;
     if (!workerDid) return;
+    // ── Security: verify the sender's DID matches the worker_did the payload claims. ──
+    const senderDid = resolveSenderDid(evt);
+    if (!senderDid || senderDid !== workerDid) return;
+    // ── Security: enforce operator-DID allowlist (via stored capability ad). ──
+    if (deps.operatorAllowlist) {
+      const cap = deps.db.capabilityFor(workerDid);
+      if (!cap || !deps.operatorAllowlist.includes(cap.operator_did)) return;
+    }
     // Persist claim (PK ensures dedup across echoes).
     deps.db.recordClaim(taskId, workerDid, Math.floor(Date.now() / 1000));
+  }
+
+  function resolveSenderDid(evt: InboundCoordinationEvent): string | undefined {
+    if (!deps.didCache) return undefined;
+    const nick = nickFromSource(evt.source);
+    if (!nick) return undefined;
+    return deps.didCache.didForNick(nick);
   }
 
   function assignFromCollected(taskId: string): void {
@@ -141,25 +195,25 @@ export function createDispatcher(deps: DispatchDeps): DispatchHandle {
     const t = deps.db.getTask(taskId);
     if (!t || t.state === 'complete' || t.state === 'failed') return;
     const payload = evt.payload as any;
-    const workerDid = payload?.worker_did ?? deriveWorkerDidFromAssignments(taskId, evt);
-    if (!workerDid) return;
+    const claimedDid = payload?.worker_did;
+    // ── Security: verify sender's DID matches payload's claimed worker_did. ──
+    const senderDid = resolveSenderDid(evt);
+    if (!senderDid) return;
+    const workerDid = claimedDid ?? senderDid;
+    if (claimedDid && claimedDid !== senderDid) return;
+    // ── Security: must be an assigned reviewer. ──
+    if (!deps.db.assignmentsFor(taskId).includes(workerDid)) return;
+    // ── Security: payload size cap. ──
+    const payloadJson = JSON.stringify(payload);
+    if (payloadJson.length > MAX_EVIDENCE_PAYLOAD_BYTES) return;
     deps.db.insertEvidence({
       event_id: evt.eventId,
       task_id: taskId,
       worker_did: workerDid,
-      payload_json: JSON.stringify(payload),
+      payload_json: payloadJson,
       received_at: Math.floor(Date.now() / 1000),
     });
     maybeFinalize(taskId);
-  }
-
-  function deriveWorkerDidFromAssignments(taskId: string, _evt: InboundCoordinationEvent): string | undefined {
-    // For Phase 5 we trust the worker_did inside the payload; if absent, we
-    // fall back to the (single) assignment if there's only one. For multi-
-    // reviewer tasks we'd need to resolve the sender. Phase 5 keeps the
-    // payload-bearing path canonical.
-    const assigned = deps.db.assignmentsFor(taskId);
-    return assigned.length === 1 ? assigned[0] : undefined;
   }
 
   function onWorkerFailure(evt: InboundCoordinationEvent): void {

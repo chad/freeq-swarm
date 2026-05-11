@@ -71,6 +71,15 @@ export function parseTaskCommand(body: string): ParseResult {
     };
   }
   const [, owner, repoName, prStr] = m;
+  // Reject path-traversal sequences in owner/repo. Without this, a URL like
+  // https://github.com/../malicious/pull/1 would survive the regex (because
+  // [\w.-]+ allows '..') and be passed to gh / matched naïvely against repo
+  // patterns.
+  for (const segment of [owner!, repoName!]) {
+    if (segment === '..' || segment === '.') {
+      return { ok: false, reason: 'bad_url', detail: `path-traversal segment in URL: ${url}` };
+    }
+  }
   const repo = `${owner}/${repoName}`;
   const pr = Number.parseInt(prStr!, 10);
 

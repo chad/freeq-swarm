@@ -235,9 +235,10 @@ export function startSummaryScheduler(deps: SummaryDeps): SummaryHandle {
       console.warn(`summary: no nick known for ${requesterDid} — skipping send`);
       return;
     }
+    const safeNick = nick.replace(/[\r\n\0 ]/g, '');
     for (const line of lines) {
       try {
-        deps.client.raw(`PRIVMSG ${nick} :${line}`);
+        deps.client.raw(`PRIVMSG ${safeNick} :${line.replace(/[\r\n\0]/g, ' ')}`);
       } catch {
         /* socket gone */
       }

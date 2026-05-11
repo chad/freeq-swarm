@@ -136,6 +136,8 @@ export async function main(opts: CoordinatorOptions = {}): Promise<void> {
     client: conn.client,
     db,
     channel: config.swarm.channel,
+    didCache,
+    operatorAllowlist: config.operator_allowlist,
   });
   const unsubEvents = subscribeCoordinationEvents(conn.client, (evt) => {
     dispatcher.handle(evt);

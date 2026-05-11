@@ -121,6 +121,14 @@ export function parseTags(raw: string): Record<string, string> {
  * Build a complete IRC line (with `@<tags> `) for a given verb + params + trailing.
  * Used by emitCoordinationEvent — callers send this verbatim via client.raw.
  */
+/** Strip raw CR/LF and NUL chars from any text destined for an IRC line.
+ *  Without this, a malicious payload (e.g. a parsed gh stderr that contains
+ *  `\r\nKICK #ch victim`) would let the attacker inject arbitrary IRC commands.
+ */
+export function safeIrcText(s: string): string {
+  return s.replace(/[\r\n\0]/g, ' ');
+}
+
 export function formatLine(
   tags: Record<string, string> | null,
   verb: 'TAGMSG' | 'PRIVMSG' | 'NOTICE',
@@ -128,8 +136,10 @@ export function formatLine(
   trailing?: string,
 ): string {
   const tagPart = tags && Object.keys(tags).length > 0 ? `@${serializeTags(tags)} ` : '';
-  const paramPart = params.length > 0 ? ` ${params.join(' ')}` : '';
-  const trailPart = trailing !== undefined ? ` :${trailing}` : '';
+  // Sanitize all params (NUL/CR/LF would split the line).
+  const safeParams = params.map(safeIrcText);
+  const paramPart = safeParams.length > 0 ? ` ${safeParams.join(' ')}` : '';
+  const trailPart = trailing !== undefined ? ` :${safeIrcText(trailing)}` : '';
   return `${tagPart}${verb}${paramPart}${trailPart}`;
 }
 
@@ -241,6 +251,11 @@ export function parseInboundCoordinationEvent(line: string): InboundCoordination
   };
 }
 
+/** Default cap on inbound coordination-event line length. The server enforces
+ *  8KB but we hard-limit lower to defend against memory amplification when
+ *  someone tries to stuff a 1MB payload that survives the IRC layer. */
+export const INBOUND_LINE_MAX_BYTES = 16 * 1024;
+
 /**
  * Subscribe to coordination events on the given client. We listen on the
  * `'raw'` event (the SDK negotiates `echo-message` so our own outbound
@@ -252,8 +267,11 @@ export function parseInboundCoordinationEvent(line: string): InboundCoordination
 export function subscribeCoordinationEvents(
   client: { on: (event: 'raw', h: (line: string, parsed: any) => void) => void; off: (event: 'raw', h: any) => void },
   handler: (event: InboundCoordinationEvent) => void,
+  opts: { maxLineBytes?: number } = {},
 ): () => void {
+  const cap = opts.maxLineBytes ?? INBOUND_LINE_MAX_BYTES;
   const onRaw = (line: string, _parsed: any): void => {
+    if (line.length > cap) return; // drop oversized lines silently
     const evt = parseInboundCoordinationEvent(line);
     if (!evt) return;
     try {
@@ -265,4 +283,14 @@ export function subscribeCoordinationEvents(
   };
   client.on('raw', onRaw);
   return () => client.off('raw', onRaw);
+}
+
+/**
+ * Extract the bare nick (everything before the first `!`) from an IRC source
+ * prefix like `nick!user@host`. Returns the input as-is if no `!`.
+ */
+export function nickFromSource(source: string | undefined): string | undefined {
+  if (!source) return undefined;
+  const i = source.indexOf('!');
+  return i === -1 ? source : source.slice(0, i);
 }
