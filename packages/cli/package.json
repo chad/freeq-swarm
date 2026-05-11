@@ -1,0 +1,18 @@
+{
+  "name": "@freeq-swarm/cli",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "bin": {
+    "swarm": "./dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@freeq-swarm/coordinator": "workspace:*",
+    "@freeq-swarm/worker": "workspace:*"
+  }
+}

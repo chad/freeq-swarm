@@ -1,0 +1,17 @@
+{
+  "name": "@freeq-swarm/coordinator",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/main.js",
+  "bin": {
+    "swarm-coordinator": "./dist/cli.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@freeq-swarm/shared": "workspace:*"
+  }
+}
