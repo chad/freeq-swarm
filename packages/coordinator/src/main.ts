@@ -22,6 +22,7 @@ import { CoordinatorDb } from './db.js';
 import { defaultRestBase, fetchBudget, issueBudget } from './budget.js';
 import { handleInboundPrivmsg } from './dispatcher.js';
 import { createDispatcher } from './dispatch.js';
+import { startSummaryScheduler } from './summary.js';
 import { subscribeCoordinationEvents } from '@freeq-swarm/shared';
 
 export interface CoordinatorOptions {
@@ -130,7 +131,7 @@ export async function main(opts: CoordinatorOptions = {}): Promise<void> {
     );
   });
 
-  // ── 11. Wire claim collector + assignment dispatcher (Phase 3) ──
+  // ── 11. Wire claim collector + assignment dispatcher (Phase 3+5) ──
   const dispatcher = createDispatcher({
     client: conn.client,
     db,
@@ -140,10 +141,19 @@ export async function main(opts: CoordinatorOptions = {}): Promise<void> {
     dispatcher.handle(evt);
   });
 
-  // ── 12. Clean shutdown ──
+  // ── 12. Summary scheduler (Phase 6) ──
+  const summary = startSummaryScheduler({
+    client: conn.client,
+    db,
+    config,
+    didCache,
+  });
+
+  // ── 13. Clean shutdown ──
   const shutdown = async (sig: string): Promise<void> => {
     console.log(`shutdown: ${sig}`);
     dispatcher.shutdown();
+    summary.shutdown();
     unsubEvents();
     await handle.stop(`coordinator ${sig}`);
     db.close();
