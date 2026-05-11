@@ -6,11 +6,14 @@
 import { createHash } from 'node:crypto';
 import {
   type InboundCoordinationEvent,
+  type Severity,
+  type Verdict,
   EVENT_TYPES,
   buildCoordinationEvent,
 } from '@freeq-swarm/shared';
 import type { FreeqClient } from '@freeq/sdk';
 import type { CoordinatorDb } from './db.js';
+import { type ReviewSummary, computeConsensus } from './verify.js';
 
 export interface DispatchDeps {
   client: FreeqClient;
@@ -37,14 +40,25 @@ interface PendingTask {
   timer: ReturnType<typeof setTimeout>;
 }
 
+interface ExecutingTask {
+  taskId: string;
+  reviewersNeeded: number;
+  startedAt: number;
+  /** Timer for execution_timeout expiry. */
+  timer: ReturnType<typeof setTimeout>;
+}
+
 export function createDispatcher(deps: DispatchDeps): DispatchHandle {
   const sched = deps.scheduler ?? { setTimeout, clearTimeout };
   const pending = new Map<string, PendingTask>();
+  const executing = new Map<string, ExecutingTask>();
 
   function handle(evt: InboundCoordinationEvent): void {
     if (evt.channel.toLowerCase() !== deps.channel.toLowerCase()) return;
     if (evt.eventType === EVENT_TYPES.task_request) onTaskRequest(evt);
     else if (evt.eventType === EVENT_TYPES.task_accept) onTaskAccept(evt);
+    else if (evt.eventType === EVENT_TYPES.evidence_attach) onEvidence(evt);
+    else if (evt.eventType === EVENT_TYPES.task_failed) onWorkerFailure(evt);
   }
 
   function onTaskRequest(evt: InboundCoordinationEvent): void {
@@ -78,25 +92,7 @@ export function createDispatcher(deps: DispatchDeps): DispatchHandle {
     if (!t) return;
     if (claims.length === 0) {
       // No claims arrived → task_failed :reason=no_claims.
-      const ev = buildCoordinationEvent(
-        deps.channel,
-        EVENT_TYPES.task_failed,
-        {
-          kind: 'swarm.failure/v1',
-          task_id: taskId,
-          reason: 'no_claims',
-          detail: 'no workers claimed within window',
-        },
-        { eventId: `${taskId}-fail`, humanText: '❌ no claims', taskId },
-      );
-      deps.client.raw(ev.tagmsg);
-      deps.client.raw(ev.privmsg);
-      deps.db.setTaskFailed({
-        task_id: taskId,
-        reason: 'no_claims',
-        detail: 'no workers claimed within window',
-        completed_at: Math.floor(Date.now() / 1000),
-      });
+      emitFailed(taskId, 'no_claims', 'no workers claimed within window');
       return;
     }
     // Pick top N (oldest claims first; deterministic hash-tiebreak).
@@ -106,7 +102,9 @@ export function createDispatcher(deps: DispatchDeps): DispatchHandle {
     });
     const chosen = sorted.slice(0, p.reviewersNeeded);
     const now = Math.floor(Date.now() / 1000);
-    const deadline = now + Math.floor((JSON.parse(t.payload_json).policy.execution_timeout_ms as number) / 1000);
+    const taskPayload = JSON.parse(t.payload_json) as any;
+    const execTimeoutMs = taskPayload.policy.execution_timeout_ms as number;
+    const deadline = now + Math.floor(execTimeoutMs / 1000);
     // Persist assignments synchronously (these power assignments_in_flight).
     for (const c of chosen) {
       deps.db.recordAssignment(taskId, c.worker_did, now);
@@ -127,6 +125,201 @@ export function createDispatcher(deps: DispatchDeps): DispatchHandle {
     });
     deps.client.raw(ev.tagmsg);
     deps.client.raw(ev.privmsg);
+    // Arm execution timeout.
+    const timer = sched.setTimeout(() => onExecutionTimeout(taskId), execTimeoutMs);
+    executing.set(taskId, {
+      taskId,
+      reviewersNeeded: p.reviewersNeeded,
+      startedAt: now,
+      timer,
+    });
+  }
+
+  function onEvidence(evt: InboundCoordinationEvent): void {
+    const taskId = evt.taskId ?? (evt.payload as any)?.task_id;
+    if (!taskId) return;
+    const t = deps.db.getTask(taskId);
+    if (!t || t.state === 'complete' || t.state === 'failed') return;
+    const payload = evt.payload as any;
+    const workerDid = payload?.worker_did ?? deriveWorkerDidFromAssignments(taskId, evt);
+    if (!workerDid) return;
+    deps.db.insertEvidence({
+      event_id: evt.eventId,
+      task_id: taskId,
+      worker_did: workerDid,
+      payload_json: JSON.stringify(payload),
+      received_at: Math.floor(Date.now() / 1000),
+    });
+    maybeFinalize(taskId);
+  }
+
+  function deriveWorkerDidFromAssignments(taskId: string, _evt: InboundCoordinationEvent): string | undefined {
+    // For Phase 5 we trust the worker_did inside the payload; if absent, we
+    // fall back to the (single) assignment if there's only one. For multi-
+    // reviewer tasks we'd need to resolve the sender. Phase 5 keeps the
+    // payload-bearing path canonical.
+    const assigned = deps.db.assignmentsFor(taskId);
+    return assigned.length === 1 ? assigned[0] : undefined;
+  }
+
+  function onWorkerFailure(evt: InboundCoordinationEvent): void {
+    // A worker may emit task_failed for itself (e.g. budget_exceeded). We
+    // treat that as a missing review and let consensus / timeout finalize.
+    const taskId = evt.taskId ?? (evt.payload as any)?.task_id;
+    if (!taskId) return;
+    const t = deps.db.getTask(taskId);
+    if (!t || t.state === 'complete' || t.state === 'failed') return;
+    // Don't insert into `evidence` — worker failure is not evidence. We rely
+    // on the execution_timeout to fire if too few evidence pieces show up.
+    maybeFinalize(taskId);
+  }
+
+  function maybeFinalize(taskId: string): void {
+    const x = executing.get(taskId);
+    if (!x) return;
+    const evidence = deps.db.evidenceFor(taskId);
+    // Only count *parseable* swarm.review/v1 evidence toward the threshold —
+    // malformed payloads sit in SQLite for audit but don't satisfy reviewers_needed.
+    let valid = 0;
+    for (const e of evidence) {
+      try {
+        const p = JSON.parse(e.payload_json);
+        if (p?.kind === 'swarm.review/v1' && typeof p.verdict === 'string') valid += 1;
+      } catch {
+        /* skip */
+      }
+    }
+    if (valid < x.reviewersNeeded) return;
+    sched.clearTimeout(x.timer);
+    executing.delete(taskId);
+    finalize(taskId);
+  }
+
+  function onExecutionTimeout(taskId: string): void {
+    const x = executing.get(taskId);
+    if (!x) return;
+    executing.delete(taskId);
+    const t = deps.db.getTask(taskId);
+    if (!t) return;
+    if (t.retries_remaining > 0) {
+      // Retry policy (Phase 5): re-emit a fresh task_request payload. Keeps
+      // the same task_id so audit trails line up.
+      deps.db.decrementRetries(taskId);
+      // Reset task to pending_claims; clear assignments + claims so a new
+      // window picks fresh workers.
+      deps.db.clearClaims(taskId);
+      deps.db.clearAssignments(taskId);
+      deps.db.setTaskState(taskId, 'pending_claims');
+      const payload = JSON.parse(t.payload_json) as any;
+      const ev = buildCoordinationEvent(
+        deps.channel,
+        EVENT_TYPES.task_request,
+        payload,
+        {
+          eventId: taskId,
+          humanText: `🔁 retry on execution_timeout (${t.retries_remaining}/${t.retries_remaining + 1} left)`,
+        },
+      );
+      deps.client.raw(ev.tagmsg);
+      deps.client.raw(ev.privmsg);
+      // Re-open claim window.
+      onTaskRequest({
+        ...({} as InboundCoordinationEvent),
+        channel: deps.channel,
+        eventType: EVENT_TYPES.task_request,
+        eventId: taskId,
+        verb: 'TAGMSG',
+        tags: {},
+        payload,
+      } as InboundCoordinationEvent);
+      return;
+    }
+    // No retries left → finalize what we have, or fail.
+    finalize(taskId, true);
+  }
+
+  function finalize(taskId: string, fromTimeout = false): void {
+    const evidence = deps.db.evidenceFor(taskId);
+    const reviews: ReviewSummary[] = [];
+    for (const e of evidence) {
+      try {
+        const p = JSON.parse(e.payload_json);
+        if (p?.kind === 'swarm.review/v1' && typeof p.verdict === 'string') {
+          reviews.push({
+            worker_did: e.worker_did,
+            verdict: p.verdict as Verdict,
+            severity: (p.severity as Severity) ?? 'none',
+          });
+        }
+      } catch {
+        /* skip malformed evidence */
+      }
+    }
+    if (reviews.length === 0 && fromTimeout) {
+      emitFailed(taskId, 'execution_timeout', 'no evidence within deadline');
+      return;
+    }
+    const consensus = computeConsensus(reviews);
+    if (!consensus.ok) {
+      emitFailed(taskId, 'consensus_irreconcilable', consensus.detail);
+      return;
+    }
+    // Emit task_complete.
+    const completionPayload = {
+      kind: 'swarm.completion/v1' as const,
+      task_id: taskId,
+      consensus_verdict: consensus.verdict,
+      consensus_severity: consensus.severity,
+      agreement_score: consensus.agreement_score,
+      reviewer_dids: reviews.map((r) => r.worker_did),
+      evidence_event_ids: evidence.map((e) => e.event_id),
+      total_usd_cost: evidence.reduce((acc, e) => {
+        try {
+          return acc + (JSON.parse(e.payload_json).usd_cost as number ?? 0);
+        } catch {
+          return acc;
+        }
+      }, 0),
+      wall_clock_ms: 0,
+    };
+    const ev = buildCoordinationEvent(
+      deps.channel,
+      EVENT_TYPES.task_complete,
+      completionPayload,
+      {
+        eventId: `${taskId}-complete`,
+        humanText: `✅ ${taskId.slice(0, 8)} — ${consensus.verdict} (${reviews.length}/${reviews.length})`,
+        taskId,
+      },
+    );
+    deps.client.raw(ev.tagmsg);
+    deps.client.raw(ev.privmsg);
+    deps.db.setTaskComplete({
+      task_id: taskId,
+      consensus_verdict: consensus.verdict,
+      consensus_severity: consensus.severity,
+      agreement_score: consensus.agreement_score,
+      completed_at: Math.floor(Date.now() / 1000),
+    });
+    // Reputation update (kept for v2 dispatch consultation).
+    for (const did of consensus.pickedDids) deps.db.bumpReputation(did, 1);
+  }
+
+  function emitFailed(taskId: string, reason: string, detail: string): void {
+    const ev = buildCoordinationEvent(
+      deps.channel,
+      EVENT_TYPES.task_failed,
+      { kind: 'swarm.failure/v1', task_id: taskId, reason, detail },
+      { eventId: `${taskId}-fail`, humanText: `❌ ${reason}`, taskId },
+    );
+    deps.client.raw(ev.tagmsg);
+    deps.client.raw(ev.privmsg);
+    deps.db.setTaskFailed({
+      task_id: taskId,
+      reason,
+      detail,
+      completed_at: Math.floor(Date.now() / 1000),
+    });
   }
 
   function flushAll(): void {
@@ -134,11 +327,17 @@ export function createDispatcher(deps: DispatchDeps): DispatchHandle {
       sched.clearTimeout(p.timer);
       assignFromCollected(p.taskId);
     }
+    for (const e of [...executing.values()]) {
+      sched.clearTimeout(e.timer);
+      onExecutionTimeout(e.taskId);
+    }
   }
 
   function shutdown(): void {
     for (const p of pending.values()) sched.clearTimeout(p.timer);
+    for (const e of executing.values()) sched.clearTimeout(e.timer);
     pending.clear();
+    executing.clear();
   }
 
   return { handle, flushAll, shutdown };

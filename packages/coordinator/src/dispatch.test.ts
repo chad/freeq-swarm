@@ -218,4 +218,186 @@ describe('createDispatcher', () => {
     d.handle(makeEvent('task_request', 'UNKNOWN', { kind: 'swarm.task/v1' }));
     expect(sched.callbacks).toHaveLength(0);
   });
+
+  // ── Phase 5: evidence + consensus ──
+
+  function feedReview(d: any, taskId: string, evId: string, did: string, verdict: string, severity = 'low'): void {
+    d.handle(makeEvent('evidence_attach', evId, {
+      kind: 'swarm.review/v1',
+      evidence_type: 'code_review',
+      task_id: taskId,
+      verdict,
+      severity,
+      summary: '',
+      comments: [],
+      truncated: false,
+      tokens_used: 100,
+      usd_cost: 0.1,
+      model: 'claude-opus-4-7',
+      via: 'api',
+      worker_did: did,
+    }, taskId));
+  }
+
+  it('finalizes task_complete on unanimous evidence', () => {
+    const db = new CoordinatorDb(':memory:');
+    seedTask(db, 'TC1', 2);
+    const c = makeClient();
+    const sched = fakeScheduler();
+    const d = createDispatcher({ client: c.client, db, channel: '#swarm', scheduler: sched.api });
+    d.handle(makeEvent('task_request', 'TC1', { kind: 'swarm.task/v1' }));
+    d.handle(makeEvent('task_accept', 'C1', { kind: 'swarm.claim/v1', task_id: 'TC1', worker_did: 'did:key:a' }, 'TC1'));
+    d.handle(makeEvent('task_accept', 'C2', { kind: 'swarm.claim/v1', task_id: 'TC1', worker_did: 'did:key:b' }, 'TC1'));
+    sched.fireAll(); // claim window → assignment + execution timer
+    feedReview(d, 'TC1', 'E1', 'did:key:a', 'approve');
+    feedReview(d, 'TC1', 'E2', 'did:key:b', 'approve');
+    // Both evidence in → maybeFinalize fires → task_complete.
+    const completes = c.sentLines.filter((l) => /event=task_complete/.test(l));
+    expect(completes.length).toBe(2);
+    const t = db.getTask('TC1')!;
+    expect(t.state).toBe('complete');
+    expect(t.consensus_verdict).toBe('approve');
+    expect(t.agreement_score).toBe(1);
+  });
+
+  it('emits consensus_irreconcilable when verdicts split 1/1/1', () => {
+    const db = new CoordinatorDb(':memory:');
+    seedTask(db, 'TC2', 3);
+    const c = makeClient();
+    const sched = fakeScheduler();
+    const d = createDispatcher({ client: c.client, db, channel: '#swarm', scheduler: sched.api });
+    d.handle(makeEvent('task_request', 'TC2', { kind: 'swarm.task/v1' }));
+    d.handle(makeEvent('task_accept', 'C1', { kind: 'swarm.claim/v1', task_id: 'TC2', worker_did: 'did:key:a' }, 'TC2'));
+    d.handle(makeEvent('task_accept', 'C2', { kind: 'swarm.claim/v1', task_id: 'TC2', worker_did: 'did:key:b' }, 'TC2'));
+    d.handle(makeEvent('task_accept', 'C3', { kind: 'swarm.claim/v1', task_id: 'TC2', worker_did: 'did:key:c' }, 'TC2'));
+    sched.fireAll();
+    feedReview(d, 'TC2', 'E1', 'did:key:a', 'approve');
+    feedReview(d, 'TC2', 'E2', 'did:key:b', 'request_changes');
+    feedReview(d, 'TC2', 'E3', 'did:key:c', 'reject');
+    const t = db.getTask('TC2')!;
+    expect(t.state).toBe('failed');
+    expect(t.failure_reason).toBe('consensus_irreconcilable');
+  });
+
+  it('execution_timeout with retries left re-emits task_request', () => {
+    const db = new CoordinatorDb(':memory:');
+    seedTask(db, 'TC3', 1);
+    const c = makeClient();
+    const sched = fakeScheduler();
+    const d = createDispatcher({ client: c.client, db, channel: '#swarm', scheduler: sched.api });
+    d.handle(makeEvent('task_request', 'TC3', { kind: 'swarm.task/v1' }));
+    d.handle(makeEvent('task_accept', 'C1', { kind: 'swarm.claim/v1', task_id: 'TC3', worker_did: 'did:key:a' }, 'TC3'));
+    sched.fireAll(); // claim window → assignment + exec timer
+    expect(db.getTask('TC3')!.retries_remaining).toBe(1);
+    sched.fireAll(); // exec timeout → retry triggers a new task_request + new claim window
+    expect(db.getTask('TC3')!.retries_remaining).toBe(0);
+    expect(db.getTask('TC3')!.state).toBe('pending_claims');
+    const requests = c.sentLines.filter((l) => /event=task_request/.test(l) && / TAGMSG /.test(l));
+    expect(requests.length).toBe(1); // the retry emit
+  });
+
+  it('execution_timeout with no retries fails the task', () => {
+    const db = new CoordinatorDb(':memory:');
+    db.insertTask({
+      task_id: 'TC4',
+      state: 'pending_claims',
+      task_type: 'pr_review',
+      requester_did: 'did:plc:r',
+      payload_json: JSON.stringify({
+        kind: 'swarm.task/v1',
+        task_type: 'pr_review',
+        requester_did: 'did:plc:r',
+        target: { repo: 'github.com/foo/bar', pr: 1, head_sha: 'a' },
+        spec: { diff_url: 'x' },
+        policy: {
+          reviewers_needed: 1,
+          claim_window_ms: 30000,
+          execution_timeout_ms: 300000,
+          max_usd_per_reviewer: 1.5,
+        },
+      }),
+      created_at: 1000,
+      retries_remaining: 0,
+    });
+    const c = makeClient();
+    const sched = fakeScheduler();
+    const d = createDispatcher({ client: c.client, db, channel: '#swarm', scheduler: sched.api });
+    d.handle(makeEvent('task_request', 'TC4', { kind: 'swarm.task/v1' }));
+    d.handle(makeEvent('task_accept', 'C1', { kind: 'swarm.claim/v1', task_id: 'TC4', worker_did: 'did:key:a' }, 'TC4'));
+    sched.fireAll();
+    sched.fireAll();
+    expect(db.getTask('TC4')!.state).toBe('failed');
+    expect(db.getTask('TC4')!.failure_reason).toBe('execution_timeout');
+  });
+
+  it('reputation increments for picked-bucket workers', () => {
+    const db = new CoordinatorDb(':memory:');
+    seedTask(db, 'TC5', 2);
+    const c = makeClient();
+    const sched = fakeScheduler();
+    const d = createDispatcher({ client: c.client, db, channel: '#swarm', scheduler: sched.api });
+    d.handle(makeEvent('task_request', 'TC5', { kind: 'swarm.task/v1' }));
+    d.handle(makeEvent('task_accept', 'C1', { kind: 'swarm.claim/v1', task_id: 'TC5', worker_did: 'did:key:a' }, 'TC5'));
+    d.handle(makeEvent('task_accept', 'C2', { kind: 'swarm.claim/v1', task_id: 'TC5', worker_did: 'did:key:b' }, 'TC5'));
+    sched.fireAll();
+    feedReview(d, 'TC5', 'E1', 'did:key:a', 'approve');
+    feedReview(d, 'TC5', 'E2', 'did:key:b', 'approve');
+    expect(db.workerState('did:key:a')!.reputation).toBe(1);
+    expect(db.workerState('did:key:b')!.reputation).toBe(1);
+  });
+
+  it('total_usd_cost in task_complete sums per-evidence cost', () => {
+    const db = new CoordinatorDb(':memory:');
+    seedTask(db, 'TC6', 2);
+    const c = makeClient();
+    const sched = fakeScheduler();
+    const d = createDispatcher({ client: c.client, db, channel: '#swarm', scheduler: sched.api });
+    d.handle(makeEvent('task_request', 'TC6', { kind: 'swarm.task/v1' }));
+    d.handle(makeEvent('task_accept', 'C1', { kind: 'swarm.claim/v1', task_id: 'TC6', worker_did: 'did:key:a' }, 'TC6'));
+    d.handle(makeEvent('task_accept', 'C2', { kind: 'swarm.claim/v1', task_id: 'TC6', worker_did: 'did:key:b' }, 'TC6'));
+    sched.fireAll();
+    feedReview(d, 'TC6', 'E1', 'did:key:a', 'approve');
+    feedReview(d, 'TC6', 'E2', 'did:key:b', 'approve');
+    const tagmsg = c.sentLines.find((l) => /event=task_complete/.test(l) && / TAGMSG /.test(l))!;
+    const parsed = parseInboundCoordinationEvent(tagmsg)!;
+    expect((parsed.payload as any).total_usd_cost).toBeCloseTo(0.2);
+  });
+
+  it('malformed evidence does not satisfy reviewers_needed; eventual timeout fails', () => {
+    const db = new CoordinatorDb(':memory:');
+    seedTask(db, 'TC7', 2);
+    const c = makeClient();
+    const sched = fakeScheduler();
+    const d = createDispatcher({ client: c.client, db, channel: '#swarm', scheduler: sched.api });
+    d.handle(makeEvent('task_request', 'TC7', { kind: 'swarm.task/v1' }));
+    d.handle(makeEvent('task_accept', 'C1', { kind: 'swarm.claim/v1', task_id: 'TC7', worker_did: 'did:key:a' }, 'TC7'));
+    d.handle(makeEvent('task_accept', 'C2', { kind: 'swarm.claim/v1', task_id: 'TC7', worker_did: 'did:key:b' }, 'TC7'));
+    sched.fireAll(); // arms execution timer
+    // A garbage evidence_attach (no verdict) — recorded but does NOT satisfy reviewers_needed.
+    d.handle(makeEvent('evidence_attach', 'E1', { worker_did: 'did:key:a', not_a_review: true }, 'TC7'));
+    expect(db.getTask('TC7')!.state).toBe('assigned'); // still waiting
+    d.handle(makeEvent('evidence_attach', 'E2', { worker_did: 'did:key:b', kind: 'swarm.review/v1', verdict: 'approve', severity: 'none' }, 'TC7'));
+    // Still only one valid review out of 2 needed.
+    expect(db.getTask('TC7')!.state).toBe('assigned');
+    sched.fireAll(); // execution timeout → retry → emits task_request → re-arms claim window
+    sched.fireAll(); // claim window fires with no new claims → no_claims → fail
+    const t = db.getTask('TC7')!;
+    expect(t.state).toBe('failed');
+  });
+
+  it('ignores evidence for already-completed task', () => {
+    const db = new CoordinatorDb(':memory:');
+    seedTask(db, 'TC8', 1);
+    const c = makeClient();
+    const sched = fakeScheduler();
+    const d = createDispatcher({ client: c.client, db, channel: '#swarm', scheduler: sched.api });
+    d.handle(makeEvent('task_request', 'TC8', { kind: 'swarm.task/v1' }));
+    d.handle(makeEvent('task_accept', 'C1', { kind: 'swarm.claim/v1', task_id: 'TC8', worker_did: 'did:key:a' }, 'TC8'));
+    sched.fireAll();
+    feedReview(d, 'TC8', 'E1', 'did:key:a', 'approve');
+    expect(db.getTask('TC8')!.state).toBe('complete');
+    // Late evidence after complete:
+    feedReview(d, 'TC8', 'E2', 'did:key:b', 'reject');
+    expect(db.getTask('TC8')!.state).toBe('complete');
+  });
 });

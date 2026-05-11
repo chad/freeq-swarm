@@ -240,6 +240,9 @@ export class CoordinatorDb {
       )
       .all(taskId);
   }
+  clearClaims(taskId: string): void {
+    this.db.prepare('DELETE FROM claims WHERE task_id = ?').run(taskId);
+  }
 
   // ── Assignments ──
   recordAssignment(taskId: string, workerDid: string, ts: number): void {
@@ -256,6 +259,9 @@ export class CoordinatorDb {
       )
       .all(taskId)
       .map((r) => r.worker_did);
+  }
+  clearAssignments(taskId: string): void {
+    this.db.prepare('DELETE FROM assignments WHERE task_id = ?').run(taskId);
   }
   /** Open assignments (no matching evidence yet, task not in terminal state) per worker. */
   openAssignmentsByWorker(): Map<string, number> {
