@@ -186,7 +186,7 @@ export function buildCoordinationEvent(
   };
 }
 
-// ── Inbound parser ──────────────────────────────────────────────────────────
+// ── Inbound parser + subscriber ─────────────────────────────────────────────
 //
 // Parse an inbound IRC line and, if it's a coordination-event TAGMSG, return
 // the structured event. Returns null otherwise.
@@ -239,4 +239,30 @@ export function parseInboundCoordinationEvent(line: string): InboundCoordination
     payload,
     tags,
   };
+}
+
+/**
+ * Subscribe to coordination events on the given client. We listen on the
+ * `'raw'` event (the SDK negotiates `echo-message` so our own outbound
+ * TAGMSGs come back too — handler should filter on `event.source` if it
+ * needs to ignore self).
+ *
+ * Returns an unsubscribe fn.
+ */
+export function subscribeCoordinationEvents(
+  client: { on: (event: 'raw', h: (line: string, parsed: any) => void) => void; off: (event: 'raw', h: any) => void },
+  handler: (event: InboundCoordinationEvent) => void,
+): () => void {
+  const onRaw = (line: string, _parsed: any): void => {
+    const evt = parseInboundCoordinationEvent(line);
+    if (!evt) return;
+    try {
+      handler(evt);
+    } catch (e) {
+      // Don't let handler errors poison the SDK's raw stream.
+      console.error('[coordination-event handler error]', e);
+    }
+  };
+  client.on('raw', onRaw);
+  return () => client.off('raw', onRaw);
 }

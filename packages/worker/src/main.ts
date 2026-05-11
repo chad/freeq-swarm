@@ -15,8 +15,10 @@ import {
   startAnnounce,
   connectClient,
   wireDidCacheToClient,
+  subscribeCoordinationEvents,
 } from '@freeq-swarm/shared';
 import { buildCapabilityAdvertisement } from './capabilities.js';
+import { createWorkerClaimer, type WorkerPresenceState } from './claim.js';
 
 export interface WorkerOptions {
   configPath?: string;
@@ -71,25 +73,40 @@ export async function main(opts: WorkerOptions = {}): Promise<void> {
     initialPresence: 'online',
   });
 
-  // ── 6. After JOIN, advertise capabilities, then PRESENCE=idle ──
-  // We listen for our own JOIN ack; first one triggers cap-ad sequence.
+  // ── 6. Worker presence + in-flight tracking (Phase 3 needs both for eligibility) ──
+  let presence: WorkerPresenceState = 'online';
+  // In-flight assignments tracked by task_id to avoid double-counting echoes.
+  const inFlightTasks = new Set<string>();
+  const setPresence = (state: WorkerPresenceState, status?: string, taskId?: string): void => {
+    presence = state;
+    const tail = [`state=${state}`];
+    if (status) tail.push(`status=${status}`);
+    if (taskId) tail.push(`task=${taskId}`);
+    try {
+      conn.client.raw(`PRESENCE :${tail.join(';')}`);
+    } catch {
+      /* socket gone */
+    }
+  };
+  const cap = buildCapabilityAdvertisement({
+    workerDid: identity.did,
+    ownerDid: config.worker.owner_did,
+    config,
+  });
+
+  // ── 7. After JOIN, advertise capabilities, then PRESENCE=idle ──
   let advertised = false;
   const advertiseAndIdle = (): void => {
     if (advertised) return;
     advertised = true;
-    const capAd = buildCapabilityAdvertisement({
-      workerDid: identity.did,
-      ownerDid: config.worker.owner_did,
-      config,
-    });
     for (const ch of config.worker.swarm_channels) {
-      const evt = buildCoordinationEvent(ch, 'status_update', capAd, {
+      const evt = buildCoordinationEvent(ch, 'status_update', cap, {
         humanText: '💪 capabilities advertised',
       });
       conn.client.raw(evt.tagmsg);
       conn.client.raw(evt.privmsg);
     }
-    conn.client.raw('PRESENCE :state=idle');
+    setPresence('idle');
     console.log(`advertised capabilities, transitioned to idle`);
   };
   conn.client.on('channelJoined', (channel) => {
@@ -99,13 +116,8 @@ export async function main(opts: WorkerOptions = {}): Promise<void> {
   // Re-publish cap ad every 15 min so late-arriving coordinators learn us.
   const capAdTimer = setInterval(() => {
     if (!advertised) return;
-    const capAd = buildCapabilityAdvertisement({
-      workerDid: identity.did,
-      ownerDid: config.worker.owner_did,
-      config,
-    });
     for (const ch of config.worker.swarm_channels) {
-      const evt = buildCoordinationEvent(ch, 'status_update', capAd, {
+      const evt = buildCoordinationEvent(ch, 'status_update', cap, {
         humanText: '💪 capabilities (refresh)',
       });
       try {
@@ -117,10 +129,47 @@ export async function main(opts: WorkerOptions = {}): Promise<void> {
     }
   }, CAP_AD_INTERVAL_MS);
 
+  // ── 8. Wire the claimer to inbound coordination events ──
+  const claimer = createWorkerClaimer({
+    client: conn.client,
+    workerDid: identity.did,
+    config,
+    capability: cap,
+    channels: config.worker.swarm_channels,
+    getPresence: () => presence,
+    getInFlight: () => inFlightTasks.size,
+    onClaim: (taskId) => {
+      // Reserve the slot synchronously to close the race between accept and
+      // the assignment landing. PLAN F-15.
+      inFlightTasks.add(taskId);
+    },
+  });
+  const unsubEvents = subscribeCoordinationEvents(conn.client, (evt) => {
+    // Filter our own echoes (we don't claim our own task_request — we're a worker, not a coordinator,
+    // so this can only match if we're misconfigured. Defense in depth.).
+    claimer(evt);
+    // Detect assignment events naming us → transition to executing; otherwise release the slot.
+    if (evt.eventType === 'task_update') {
+      const a = evt.payload as any;
+      if (a?.kind === 'swarm.assignment/v1' && Array.isArray(a.assigned_to)) {
+        const tid = a.task_id as string;
+        if (a.assigned_to.includes(identity.did)) {
+          setPresence('executing', `working on ${tid.slice(0, 8)}`, tid);
+          // Phase 4a will execute here. For Phase 3, we just hold the slot
+          // and release on a synthetic "complete" trigger from upstream.
+        } else {
+          // Not assigned: release the speculative reservation.
+          inFlightTasks.delete(tid);
+        }
+      }
+    }
+  });
+
   // ── 7. Clean shutdown ──
   const shutdown = async (sig: string): Promise<void> => {
     console.log(`shutdown: ${sig}`);
     clearInterval(capAdTimer);
+    unsubEvents();
     await handle.stop(`worker ${sig}`);
     process.exit(0);
   };
