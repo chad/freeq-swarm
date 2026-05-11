@@ -12,6 +12,7 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.30.0",
     "@freeq-swarm/shared": "workspace:*",
     "@freeq/sdk": "file:../../../freeq/freeq-sdk-js"
   }

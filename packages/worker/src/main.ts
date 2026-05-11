@@ -19,6 +19,10 @@ import {
 } from '@freeq-swarm/shared';
 import { buildCapabilityAdvertisement } from './capabilities.js';
 import { createWorkerClaimer, type WorkerPresenceState } from './claim.js';
+import { fetchPinnedDiff } from './diff.js';
+import { runPrReview } from './executors/pr_review.js';
+import { emitSpend } from './spend.js';
+import { EVENT_TYPES } from '@freeq-swarm/shared';
 
 export interface WorkerOptions {
   configPath?: string;
@@ -155,15 +159,116 @@ export async function main(opts: WorkerOptions = {}): Promise<void> {
         const tid = a.task_id as string;
         if (a.assigned_to.includes(identity.did)) {
           setPresence('executing', `working on ${tid.slice(0, 8)}`, tid);
-          // Phase 4a will execute here. For Phase 3, we just hold the slot
-          // and release on a synthetic "complete" trigger from upstream.
+          // Find the source task_request payload from cached state. For v1
+          // we re-fetch from the channel event log; here we keep the task
+          // payload in memory keyed by task id.
+          const task = pendingTaskPayloads.get(tid);
+          if (task) {
+            void runReviewWorkflow(tid, task);
+          }
         } else {
-          // Not assigned: release the speculative reservation.
           inFlightTasks.delete(tid);
         }
       }
     }
+    // Capture task_request payloads so the assignment handler can replay them.
+    if (evt.eventType === EVENT_TYPES.task_request) {
+      pendingTaskPayloads.set(evt.eventId, evt.payload);
+    }
   });
+
+  // Map of task_id → captured task_request payload, used when our worker is assigned.
+  const pendingTaskPayloads = new Map<string, unknown>();
+
+  const releaseSlot = (tid: string): void => {
+    inFlightTasks.delete(tid);
+    pendingTaskPayloads.delete(tid);
+    setPresence('idle');
+  };
+
+  const emitFailed = (tid: string, reason: string, detail: string): void => {
+    for (const ch of config.worker.swarm_channels) {
+      const ev = buildCoordinationEvent(
+        ch,
+        EVENT_TYPES.task_failed,
+        { kind: 'swarm.failure/v1', task_id: tid, reason, detail },
+        { eventId: `${tid}-fail`, humanText: `❌ ${reason}`, taskId: tid },
+      );
+      conn.client.raw(ev.tagmsg);
+      conn.client.raw(ev.privmsg);
+    }
+    releaseSlot(tid);
+  };
+
+  async function runReviewWorkflow(taskId: string, taskPayload: any): Promise<void> {
+    const target = taskPayload?.target ?? {};
+    const repo = String(target.repo ?? '').replace(/^github\.com\//, '');
+    const pr = Number(target.pr);
+    const headSha = String(target.head_sha ?? '');
+    const reviewFocus: string[] = Array.isArray(taskPayload?.spec?.review_focus)
+      ? taskPayload.spec.review_focus
+      : ['correctness'];
+    const model = config.runtime.models[0]!;
+    // Fetch diff (gh api SHA-pinned).
+    const channels = config.worker.swarm_channels;
+    for (const ch of channels) {
+      const ev = buildCoordinationEvent(
+        ch,
+        EVENT_TYPES.task_update,
+        { kind: 'swarm.progress/v1', task_id: taskId, phase: 'fetching_diff', detail: `${repo}#${pr}` },
+        { eventId: `${taskId}-progress-fetch`, humanText: '⚙ fetching diff', taskId },
+      );
+      conn.client.raw(ev.tagmsg);
+      conn.client.raw(ev.privmsg);
+    }
+    const diffRes = await fetchPinnedDiff({ repo, pr, expectedHeadSha: headSha });
+    if (!diffRes.ok) {
+      emitFailed(taskId, diffRes.reason, diffRes.detail ?? '');
+      return;
+    }
+    // Run review.
+    for (const ch of channels) {
+      const ev = buildCoordinationEvent(
+        ch,
+        EVENT_TYPES.task_update,
+        {
+          kind: 'swarm.progress/v1',
+          task_id: taskId,
+          phase: 'reviewing',
+          detail: `${diffRes.files} files, +${diffRes.totalAdditions}/-${diffRes.totalDeletions}`,
+        },
+        { eventId: `${taskId}-progress-review`, humanText: '⚙ reviewing', taskId },
+      );
+      conn.client.raw(ev.tagmsg);
+      conn.client.raw(ev.privmsg);
+    }
+    let review;
+    try {
+      review = await runPrReview({
+        taskId,
+        diff: diffRes.diff,
+        reviewFocus,
+        model: model.model,
+        via: model.via,
+      });
+    } catch (e) {
+      emitFailed(taskId, 'all_workers_failed', String(e).slice(0, 240));
+      return;
+    }
+    // Emit evidence.
+    for (const ch of channels) {
+      const ev = buildCoordinationEvent(ch, EVENT_TYPES.evidence_attach, review, {
+        eventId: `${taskId}-evidence`,
+        humanText: `📎 review submitted (verdict=${review.verdict})`,
+        taskId,
+        evidenceType: 'code_review',
+      });
+      conn.client.raw(ev.tagmsg);
+      conn.client.raw(ev.privmsg);
+      emitSpend({ client: conn.client, channel: ch, amount: review.usd_cost, taskId });
+    }
+    releaseSlot(taskId);
+  }
 
   // ── 7. Clean shutdown ──
   const shutdown = async (sig: string): Promise<void> => {
