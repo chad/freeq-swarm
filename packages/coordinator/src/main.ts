@@ -23,6 +23,7 @@ import { defaultRestBase, fetchBudget, issueBudget } from './budget.js';
 import { handleInboundPrivmsg } from './dispatcher.js';
 import { createDispatcher } from './dispatch.js';
 import { startSummaryScheduler } from './summary.js';
+import { handleDiscoveryRequest } from './discovery.js';
 import { subscribeCoordinationEvents } from '@freeq-swarm/shared';
 
 export interface CoordinatorOptions {
@@ -123,11 +124,23 @@ export async function main(opts: CoordinatorOptions = {}): Promise<void> {
     }
   }, 5000);
 
-  // ── 10. Wire inbound PRIVMSG handler (Phase 2 ingestion) ──
+  // ── 10. Wire inbound PRIVMSG handler (Phase 2 ingestion + discovery) ──
   conn.client.on('message', (channel, m) => {
+    const inb = { target: channel, from: m.from ?? '', text: m.text ?? '' };
+    // Discovery: a candidate worker DMs us "whoareyou".
+    handleDiscoveryRequest(
+      {
+        client: conn.client,
+        config,
+        coordinatorDid: identity.did,
+        didCache,
+      },
+      inb,
+    );
+    // Channel ingestion: humans posting "@swarm review <pr>".
     void handleInboundPrivmsg(
       { client: conn.client, db, config, didCache },
-      { target: channel, from: m.from ?? '', text: m.text ?? '' },
+      inb,
     );
   });
 

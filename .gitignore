@@ -6,6 +6,11 @@ dist/
 .env.local
 *.tsbuildinfo
 
+# Stray TS-emit fallout (we only ever want emit under dist/)
+packages/*/src/**/*.d.ts
+packages/*/src/**/*.js
+packages/*/src/**/*.js.map
+
 # coordinator/worker runtime data (do not commit)
 *.sqlite
 *.sqlite-journal

@@ -70,6 +70,40 @@ export const CapabilityAdvertisement = z.object({
 });
 export type CapabilityAdvertisement = z.infer<typeof CapabilityAdvertisement>;
 
+// ── Channel discovery (responds to `whoareyou` DM from a prospective worker) ─
+
+export const SwarmDiscovery = z.object({
+  kind: z.literal('swarm.discovery/v1'),
+  swarm_name: z.string(),
+  channel: z.string(),
+  founder_did: z.string(),
+  coordinator_did: z.string(),
+  coordinator_nick: z.string(),
+  task_types: z.array(z.string()),
+  /** Hint at recommended runtime config — informational only, not enforced. */
+  recommended: z.object({
+    model: z.string().optional(),
+    via: z.enum(['api', 'cli', 'max-subscription']).optional(),
+    max_concurrent: z.number().int().positive().optional(),
+    languages: z.array(z.string()).optional(),
+    max_diff_kloc: z.number().int().positive().optional(),
+  }),
+  policy: z.object({
+    allowed_repo_patterns: z.array(z.string()),
+    max_usd_per_task: z.number().nonnegative(),
+    daily_usd_per_agent: z.number().nonnegative(),
+  }),
+  /**
+   * Operator-DID gate: workers must be in this allowlist to be admitted by
+   * the coordinator. Prospective participants must ask the founder to add
+   * their did:plc:... before this discovery is useful.
+   */
+  operator_allowlist_hint: z.array(z.string()),
+  /** Free-form description shown to the user before they approve. */
+  description: z.string().optional(),
+});
+export type SwarmDiscovery = z.infer<typeof SwarmDiscovery>;
+
 // ── §5.4 task_request ───────────────────────────────────────────────────────
 
 export const TaskRequest = z.object({
