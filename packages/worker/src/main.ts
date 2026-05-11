@@ -21,6 +21,7 @@ import { buildCapabilityAdvertisement } from './capabilities.js';
 import { createWorkerClaimer, type WorkerPresenceState } from './claim.js';
 import { fetchPinnedDiff } from './diff.js';
 import { estimateReviewCostUsd, runPrReview } from './executors/pr_review.js';
+import { runIssueFix } from './executors/issue_fix.js';
 import { emitSpend } from './spend.js';
 import { attachGovernanceHandler, type GovernanceState } from './governance.js';
 import { EVENT_TYPES } from '@freeq-swarm/shared';
@@ -185,7 +186,7 @@ export async function main(opts: WorkerOptions = {}): Promise<void> {
           // payload in memory keyed by task id.
           const task = pendingTaskPayloads.get(tid);
           if (task) {
-            void runReviewWorkflow(tid, task);
+            void runWorkflow(tid, task);
           }
         } else {
           inFlightTasks.delete(tid);
@@ -220,6 +221,56 @@ export async function main(opts: WorkerOptions = {}): Promise<void> {
     }
     releaseSlot(tid);
   };
+
+  async function runWorkflow(taskId: string, taskPayload: any): Promise<void> {
+    if (taskPayload?.task_type === 'issue_fix') return runIssueFixWorkflow(taskId, taskPayload);
+    return runReviewWorkflow(taskId, taskPayload);
+  }
+
+  async function runIssueFixWorkflow(taskId: string, taskPayload: any): Promise<void> {
+    const target = taskPayload?.target ?? {};
+    const spec = taskPayload?.spec ?? {};
+    const repo = String(target.repo ?? '').replace(/^github\.com\//, '');
+    const issue = Number(target.issue);
+    const baseBranch = String(target.base_branch ?? 'main');
+    const model = config.runtime.models[0]!;
+    try {
+      const submission = await runIssueFix({
+        taskId,
+        workerDid: identity.did,
+        repo,
+        issue,
+        baseBranch,
+        title: String(spec.title ?? ''),
+        body: String(spec.body ?? ''),
+        testCommand: spec.test_command ?? null,
+        maxTurns: Number(spec.max_turns ?? 30),
+        model: model.model,
+        via: model.via,
+        maxUsdPerTask: config.constraints.max_usd_per_task,
+      });
+      for (const ch of config.worker.swarm_channels) {
+        const ev = buildCoordinationEvent(ch, EVENT_TYPES.evidence_attach, submission, {
+          eventId: `${taskId}-evidence`,
+          humanText:
+            submission.verdict === 'submitted'
+              ? `🚀 PR opened: ${submission.pr_url}`
+              : `⚠ ${submission.verdict}: ${submission.summary}`,
+          taskId,
+          evidenceType: 'code_submission',
+        });
+        conn.client.raw(ev.tagmsg);
+        conn.client.raw(ev.privmsg);
+        if (submission.usd_cost > 0) {
+          emitSpend({ client: conn.client, channel: ch, amount: submission.usd_cost, taskId });
+        }
+      }
+    } catch (e) {
+      emitFailed(taskId, 'all_workers_failed', String(e).slice(0, 240));
+      return;
+    }
+    releaseSlot(taskId);
+  }
 
   async function runReviewWorkflow(taskId: string, taskPayload: any): Promise<void> {
     const target = taskPayload?.target ?? {};

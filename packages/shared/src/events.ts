@@ -104,13 +104,18 @@ export const SwarmDiscovery = z.object({
 });
 export type SwarmDiscovery = z.infer<typeof SwarmDiscovery>;
 
-// ── §5.4 task_request ───────────────────────────────────────────────────────
+// ── §5.4 task_request (pr_review) ───────────────────────────────────────────
+
+const TaskPolicy = z.object({
+  reviewers_needed: z.number().int().positive(),
+  claim_window_ms: z.number().int().positive(),
+  execution_timeout_ms: z.number().int().positive(),
+  max_usd_per_reviewer: z.number().nonnegative(),
+});
 
 export const TaskRequest = z.object({
   kind: z.literal('swarm.task/v1'),
   task_type: z.literal('pr_review'),
-  // null permitted for failure-detail intermediate state only; coordinator
-  // refuses to actually post a task_request with null requester_did.
   requester_did: z.string().nullable(),
   target: z.object({
     repo: z.string(),
@@ -121,14 +126,42 @@ export const TaskRequest = z.object({
     diff_url: z.string(),
     review_focus: z.array(z.string()),
   }),
-  policy: z.object({
-    reviewers_needed: z.number().int().positive(),
-    claim_window_ms: z.number().int().positive(),
-    execution_timeout_ms: z.number().int().positive(),
-    max_usd_per_reviewer: z.number().nonnegative(),
-  }),
+  policy: TaskPolicy,
 });
 export type TaskRequest = z.infer<typeof TaskRequest>;
+
+// ── §5.4 task_request (issue_fix — software-factory mode) ───────────────────
+//
+// Worker clones the repo, runs Claude in agentic mode against the issue,
+// commits, pushes to a fork, opens a cross-fork PR.
+export const IssueFixRequest = z.object({
+  kind: z.literal('swarm.task/v1'),
+  task_type: z.literal('issue_fix'),
+  requester_did: z.string().nullable(),
+  target: z.object({
+    /** github owner/repo (no 'github.com/' prefix). */
+    repo: z.string(),
+    /** Issue number on the upstream repo. */
+    issue: z.number().int().positive(),
+    /** Branch we should fork from (typically 'main'). */
+    base_branch: z.string().default('main'),
+  }),
+  spec: z.object({
+    /** Issue title for prompt context. */
+    title: z.string(),
+    /** Issue body for prompt context. */
+    body: z.string(),
+    /** Optional shell command for the worker to run as a smoke check. */
+    test_command: z.string().nullable(),
+    /** Hard cap on how many agentic turns Claude is allowed. */
+    max_turns: z.number().int().positive().default(30),
+  }),
+  policy: TaskPolicy,
+});
+export type IssueFixRequest = z.infer<typeof IssueFixRequest>;
+
+export const AnyTaskRequest = z.union([TaskRequest, IssueFixRequest]);
+export type AnyTaskRequest = z.infer<typeof AnyTaskRequest>;
 
 // ── §5.5 task_accept (claim) ────────────────────────────────────────────────
 
@@ -185,6 +218,37 @@ export const Review = z.object({
   via: z.enum(['api', 'cli', 'max-subscription']),
 });
 export type Review = z.infer<typeof Review>;
+
+// ── §5.7 evidence_attach (issue_fix → code submission with PR URL) ──────────
+
+export const SubmissionVerdict = z.enum(['submitted', 'failed_to_change', 'failed_tests', 'gave_up']);
+export type SubmissionVerdict = z.infer<typeof SubmissionVerdict>;
+
+export const TestOutcome = z.enum(['passed', 'failed', 'skipped']);
+export type TestOutcome = z.infer<typeof TestOutcome>;
+
+export const Submission = z.object({
+  kind: z.literal('swarm.submission/v1'),
+  evidence_type: z.literal('code_submission'),
+  task_id: z.string(),
+  worker_did: z.string(),
+  verdict: SubmissionVerdict,
+  /** Set iff verdict==submitted. */
+  pr_url: z.string().nullable(),
+  branch_name: z.string().nullable(),
+  summary: z.string(),
+  files_changed: z.number().int().nonnegative(),
+  additions: z.number().int().nonnegative(),
+  deletions: z.number().int().nonnegative(),
+  test_command: z.string().nullable(),
+  test_outcome: TestOutcome,
+  test_log_tail: z.string().nullable(),
+  tokens_used: z.number().int().nonnegative(),
+  usd_cost: z.number().nonnegative(),
+  model: z.string(),
+  via: z.enum(['api', 'cli', 'max-subscription']),
+});
+export type Submission = z.infer<typeof Submission>;
 
 // ── §5.9 task_complete ──────────────────────────────────────────────────────
 

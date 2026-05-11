@@ -13,8 +13,8 @@ import {
 } from '@freeq-swarm/shared';
 import type { FreeqClient } from '@freeq/sdk';
 import type { CoordinatorDb } from './db.js';
-import { fetchPrHeadInfo, type GhOptions } from './gh.js';
-import { parseTaskCommand, stripAddressing } from './ingest.js';
+import { fetchPrHeadInfo, fetchIssue, type GhOptions } from './gh.js';
+import { type ParsedIssueFixSpec, type ParsedReviewSpec, parseTaskCommand, stripAddressing } from './ingest.js';
 
 export interface IngestionDeps {
   client: FreeqClient;
@@ -93,8 +93,20 @@ export async function handleInboundPrivmsg(
     return;
   }
 
-  // Resolve head_sha via gh.
-  const head = await fetchPrHeadInfo(stripGitHubPrefix(parsed.spec.repo), parsed.spec.pr, deps.ghOpts);
+  if (parsed.spec.task_type === 'pr_review') {
+    return ingestReview(deps, parsed.spec, taskTypeCfg, requesterDid, msg);
+  }
+  return ingestFix(deps, parsed.spec, taskTypeCfg, requesterDid, msg);
+}
+
+async function ingestReview(
+  deps: IngestionDeps,
+  spec: ParsedReviewSpec,
+  taskTypeCfg: any,
+  requesterDid: string,
+  msg: InboundPrivmsg,
+): Promise<void> {
+  const head = await fetchPrHeadInfo(stripGitHubPrefix(spec.repo), spec.pr, deps.ghOpts);
   if (!head.ok) {
     const reasonDetail = `${head.failure.kind}: ${head.failure.message.slice(0, 240)}`;
     return emitTaskFailed(deps, {
@@ -104,19 +116,74 @@ export async function handleInboundPrivmsg(
       humanText: `❌ ingestion failed: ${head.failure.kind}`,
     });
   }
-
-  // Build + persist task_request, emit pair.
-  const reviewersNeeded = parsed.spec.flags.reviewers ?? taskTypeCfg.reviewers_needed;
+  const reviewersNeeded = spec.flags.reviewers ?? taskTypeCfg.reviewers_needed;
   const taskId = newUlid();
   const now = Math.floor(Date.now() / 1000);
   const payload = {
     kind: 'swarm.task/v1' as const,
     task_type: 'pr_review' as const,
     requester_did: requesterDid,
-    target: { repo: parsed.spec.repo, pr: parsed.spec.pr, head_sha: head.info.head_sha },
+    target: { repo: spec.repo, pr: spec.pr, head_sha: head.info.head_sha },
+    spec: { diff_url: head.info.diff_url, review_focus: ['correctness', 'test_coverage'] },
+    policy: {
+      reviewers_needed: reviewersNeeded,
+      claim_window_ms: taskTypeCfg.claim_window_ms,
+      execution_timeout_ms: taskTypeCfg.execution_timeout_ms,
+      max_usd_per_reviewer: taskTypeCfg.max_usd_per_reviewer,
+    },
+  };
+  deps.db.insertTask({
+    task_id: taskId,
+    state: 'pending_claims',
+    task_type: 'pr_review',
+    requester_did: requesterDid,
+    payload_json: JSON.stringify(payload),
+    created_at: now,
+    retries_remaining: taskTypeCfg.max_retries_on_timeout,
+  });
+  const evt = buildCoordinationEvent(deps.config.swarm.channel, EVENT_TYPES.task_request, payload, {
+    eventId: taskId,
+    humanText: `📋 review ${spec.repo}#${spec.pr} (head ${head.info.head_sha.slice(0, 7)}) — claims open ${Math.round(taskTypeCfg.claim_window_ms / 1000)}s`,
+  });
+  deps.client.raw(evt.tagmsg);
+  deps.client.raw(evt.privmsg);
+}
+
+async function ingestFix(
+  deps: IngestionDeps,
+  spec: ParsedIssueFixSpec,
+  taskTypeCfg: any,
+  requesterDid: string,
+  msg: InboundPrivmsg,
+): Promise<void> {
+  const issue = await fetchIssue(stripGitHubPrefix(spec.repo), spec.issue, deps.ghOpts);
+  if (!issue.ok) {
+    return emitTaskFailed(deps, {
+      taskId: newUlid(),
+      reason: 'ingestion_error',
+      detail: `${issue.failure.kind}: ${issue.failure.message.slice(0, 240)}`,
+      humanText: `❌ ingestion failed: ${issue.failure.kind}`,
+    });
+  }
+  // issue_fix is intentionally single-worker by default — first claim wins.
+  // The founder can override via task_type config but the natural shape is 1.
+  const reviewersNeeded = 1;
+  const taskId = newUlid();
+  const now = Math.floor(Date.now() / 1000);
+  const payload = {
+    kind: 'swarm.task/v1' as const,
+    task_type: 'issue_fix' as const,
+    requester_did: requesterDid,
+    target: {
+      repo: spec.repo,
+      issue: spec.issue,
+      base_branch: spec.flags.base_branch ?? 'main',
+    },
     spec: {
-      diff_url: head.info.diff_url,
-      review_focus: ['correctness', 'test_coverage'],
+      title: issue.info.title,
+      body: issue.info.body,
+      test_command: spec.flags.test_command ?? null,
+      max_turns: spec.flags.max_turns ?? 30,
     },
     policy: {
       reviewers_needed: reviewersNeeded,
@@ -125,23 +192,21 @@ export async function handleInboundPrivmsg(
       max_usd_per_reviewer: taskTypeCfg.max_usd_per_reviewer,
     },
   };
-
-  db.insertTask({
+  deps.db.insertTask({
     task_id: taskId,
     state: 'pending_claims',
-    task_type: parsed.spec.task_type,
+    task_type: 'issue_fix',
     requester_did: requesterDid,
     payload_json: JSON.stringify(payload),
     created_at: now,
     retries_remaining: taskTypeCfg.max_retries_on_timeout,
   });
-
-  const evt = buildCoordinationEvent(channel, EVENT_TYPES.task_request, payload, {
+  const evt = buildCoordinationEvent(deps.config.swarm.channel, EVENT_TYPES.task_request, payload, {
     eventId: taskId,
-    humanText: `📋 review ${parsed.spec.repo}#${parsed.spec.pr} (head ${head.info.head_sha.slice(0, 7)}) — claims open ${Math.round(taskTypeCfg.claim_window_ms / 1000)}s`,
+    humanText: `🛠 fix ${spec.repo}#${spec.issue} "${issue.info.title.slice(0, 60)}" — claim opens for ${Math.round(taskTypeCfg.claim_window_ms / 1000)}s`,
   });
-  client.raw(evt.tagmsg);
-  client.raw(evt.privmsg);
+  deps.client.raw(evt.tagmsg);
+  deps.client.raw(evt.privmsg);
 }
 
 function emitTaskFailed(

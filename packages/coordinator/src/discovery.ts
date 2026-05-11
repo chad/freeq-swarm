@@ -41,8 +41,20 @@ export function handleDiscoveryRequest(
   // Only DMs (target is our coordinator nick) trigger this.
   if (msg.target.toLowerCase() !== deps.config.swarm.coordinator_nick.toLowerCase()) return;
   if (!TRIGGER.test(msg.text)) return;
-  const taskType = Object.keys(deps.config.task_types)[0] ?? 'pr_review';
-  const tcfg = deps.config.task_types[taskType]!;
+  // Union of allowed_repo_patterns across all configured task types — workers
+  // need to accept tasks from any of them. Per-task cap picks the highest
+  // recommended ceiling so worker config doesn't accidentally underprovision.
+  const taskTypes = Object.keys(deps.config.task_types);
+  const allowedPatterns = new Set<string>();
+  let maxUsdPerTask = 0;
+  for (const tt of taskTypes) {
+    const c = deps.config.task_types[tt]!;
+    for (const p of c.allowed_repo_patterns) allowedPatterns.add(p);
+    if (c.max_usd_per_reviewer > maxUsdPerTask) maxUsdPerTask = c.max_usd_per_reviewer;
+  }
+  // For software-factory mode (issue_fix), we recommend `via: cli` so the
+  // worker can shell out to `claude` for agentic edits. Otherwise default to api.
+  const includesFix = taskTypes.includes('issue_fix');
   const payload: SwarmDiscovery = {
     kind: 'swarm.discovery/v1',
     swarm_name: deps.config.swarm.channel.replace(/^#/, ''),
@@ -50,17 +62,17 @@ export function handleDiscoveryRequest(
     founder_did: deps.config.swarm.founder_did,
     coordinator_did: deps.coordinatorDid,
     coordinator_nick: deps.config.swarm.coordinator_nick,
-    task_types: Object.keys(deps.config.task_types),
+    task_types: taskTypes,
     recommended: {
       model: 'claude-opus-4-7',
-      via: 'api',
+      via: includesFix ? 'cli' : 'api',
       max_concurrent: 1,
       languages: ['typescript', 'rust', 'python'],
       max_diff_kloc: 10,
     },
     policy: {
-      allowed_repo_patterns: tcfg.allowed_repo_patterns,
-      max_usd_per_task: tcfg.max_usd_per_reviewer,
+      allowed_repo_patterns: [...allowedPatterns],
+      max_usd_per_task: maxUsdPerTask,
       daily_usd_per_agent: deps.config.budget.daily_usd_per_agent,
     },
     operator_allowlist_hint: deps.config.operator_allowlist,

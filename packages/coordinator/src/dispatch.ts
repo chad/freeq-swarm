@@ -241,13 +241,14 @@ export function createDispatcher(deps: DispatchDeps): DispatchHandle {
     const x = executing.get(taskId);
     if (!x) return;
     const evidence = deps.db.evidenceFor(taskId);
-    // Only count *parseable* swarm.review/v1 evidence toward the threshold —
+    // Only count *parseable* evidence (review or submission) toward the threshold —
     // malformed payloads sit in SQLite for audit but don't satisfy reviewers_needed.
     let valid = 0;
     for (const e of evidence) {
       try {
         const p = JSON.parse(e.payload_json);
         if (p?.kind === 'swarm.review/v1' && typeof p.verdict === 'string') valid += 1;
+        else if (p?.kind === 'swarm.submission/v1' && typeof p.verdict === 'string') valid += 1;
       } catch {
         /* skip */
       }
@@ -303,6 +304,69 @@ export function createDispatcher(deps: DispatchDeps): DispatchHandle {
 
   function finalize(taskId: string, fromTimeout = false): void {
     const evidence = deps.db.evidenceFor(taskId);
+    const t = deps.db.getTask(taskId);
+    const isFix = t?.task_type === 'issue_fix';
+
+    if (isFix) {
+      // Software-factory mode: pick the first valid submission with verdict=submitted.
+      // If none submitted but some came in (failed_to_change / failed_tests), report
+      // task_failed with details. If none arrived at all on timeout, execution_timeout.
+      const submissions: Array<{ worker_did: string; payload: any }> = [];
+      for (const e of evidence) {
+        try {
+          const p = JSON.parse(e.payload_json);
+          if (p?.kind === 'swarm.submission/v1' && typeof p.verdict === 'string') {
+            submissions.push({ worker_did: e.worker_did, payload: p });
+          }
+        } catch { /* skip */ }
+      }
+      if (submissions.length === 0 && fromTimeout) {
+        emitFailed(taskId, 'execution_timeout', 'no submission within deadline');
+        return;
+      }
+      const winners = submissions.filter((s) => s.payload.verdict === 'submitted');
+      if (winners.length === 0) {
+        const reasons = submissions.map((s) => `${s.payload.verdict}`).join(', ') || 'no submissions';
+        emitFailed(taskId, 'all_workers_failed', `workers tried but didn't ship: ${reasons}`);
+        return;
+      }
+      const winner = winners[0]!;
+      const completionPayload = {
+        kind: 'swarm.completion/v1' as const,
+        task_id: taskId,
+        consensus_verdict: 'submitted',
+        consensus_severity: 'none',
+        agreement_score: 1.0,
+        reviewer_dids: [winner.worker_did],
+        evidence_event_ids: evidence.map((e) => e.event_id),
+        pr_url: winner.payload.pr_url,
+        total_usd_cost: submissions.reduce((a, s) => a + (s.payload.usd_cost ?? 0), 0),
+        wall_clock_ms: 0,
+      };
+      const ev = buildCoordinationEvent(
+        deps.channel,
+        EVENT_TYPES.task_complete,
+        completionPayload,
+        {
+          eventId: `${taskId}-complete`,
+          humanText: `🚀 ${taskId.slice(0, 8)} → ${winner.payload.pr_url}`,
+          taskId,
+        },
+      );
+      deps.client.raw(ev.tagmsg);
+      deps.client.raw(ev.privmsg);
+      deps.db.setTaskComplete({
+        task_id: taskId,
+        consensus_verdict: 'submitted',
+        consensus_severity: 'none',
+        agreement_score: 1.0,
+        completed_at: Math.floor(Date.now() / 1000),
+      });
+      deps.db.bumpReputation(winner.worker_did, 1);
+      return;
+    }
+
+    // pr_review path (default)
     const reviews: ReviewSummary[] = [];
     for (const e of evidence) {
       try {

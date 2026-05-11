@@ -90,6 +90,48 @@ export function mapGhFailure(stderr: string, err?: Error): GhFailure {
   return { kind: 'network_error', message: msg };
 }
 
+export interface IssueInfo {
+  title: string;
+  body: string;
+  state: 'open' | 'closed' | string;
+  url: string;
+}
+
+/**
+ * Fetch issue title + body + state via `gh issue view`.
+ * Used by issue_fix ingestion to populate the task spec for the worker.
+ */
+export async function fetchIssue(
+  repo: string,
+  issue: number,
+  opts: GhOptions = {},
+): Promise<{ ok: true; info: IssueInfo } | { ok: false; failure: GhFailure }> {
+  let res: GhResult;
+  try {
+    res = await runGh(
+      ['issue', 'view', String(issue), '--repo', repo, '--json', 'title,body,state,url'],
+      opts,
+    );
+  } catch (err) {
+    return { ok: false, failure: mapGhFailure('', err as Error) };
+  }
+  if (res.code !== 0) return { ok: false, failure: mapGhFailure(res.stderr) };
+  let parsed: any;
+  try {
+    parsed = JSON.parse(res.stdout);
+  } catch {
+    return { ok: false, failure: { kind: 'network_error', message: `bad JSON from gh: ${res.stdout}` } };
+  }
+  const title = typeof parsed?.title === 'string' ? parsed.title : '';
+  const body = typeof parsed?.body === 'string' ? parsed.body : '';
+  const state = typeof parsed?.state === 'string' ? parsed.state : 'open';
+  const url = typeof parsed?.url === 'string' ? parsed.url : `https://github.com/${repo}/issues/${issue}`;
+  if (!title) {
+    return { ok: false, failure: { kind: 'network_error', message: 'gh returned no title' } };
+  }
+  return { ok: true, info: { title, body, state, url } };
+}
+
 /**
  * Fetch the PR's head/base SHA + diff URL via `gh pr view`. PLAN §5.4.
  */
