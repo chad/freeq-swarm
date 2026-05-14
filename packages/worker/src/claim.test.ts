@@ -1,6 +1,12 @@
 import { describe, expect, it } from 'vitest';
 import { createWorkerClaimer, evaluateEligibility } from './claim.js';
-import type { CapabilityAdvertisement, WorkerConfig, InboundCoordinationEvent } from '@freeq-swarm/shared';
+import {
+  newUlid,
+  ulidAt,
+  type CapabilityAdvertisement,
+  type WorkerConfig,
+  type InboundCoordinationEvent,
+} from '@freeq-swarm/shared';
 
 const CAP: CapabilityAdvertisement = {
   kind: 'swarm.capabilities/v1',
@@ -84,7 +90,11 @@ describe('evaluateEligibility', () => {
   });
 });
 
-function makeRequestEvent(taskId = '01HZN'): InboundCoordinationEvent {
+// Use a real ULID generated "now" so the worker's claim-window freshness
+// check (decodeTime(eventId) compared against payload.policy.claim_window_ms)
+// accepts the test event. Tests that want to exercise the stale-event path
+// should pass a ULID encoding an older timestamp via the optional arg.
+function makeRequestEvent(taskId = newUlid()): InboundCoordinationEvent {
   return {
     source: 'coord!u@h',
     verb: 'TAGMSG',
@@ -210,7 +220,35 @@ describe('createWorkerClaimer', () => {
       getInFlight: () => 1,
       onIneligible: (id, r) => reasons.push([id, r]),
     });
-    claimer(makeRequestEvent('TASK1'));
-    expect(reasons).toEqual([['TASK1', 'at concurrency cap (1/1)']]);
+    const taskId = newUlid();
+    claimer(makeRequestEvent(taskId));
+    expect(reasons).toEqual([[taskId, 'at concurrency cap (1/1)']]);
+  });
+
+  it('skips task_requests whose claim window has already closed', () => {
+    // CHATHISTORY-replay scenario: the worker joins, the SDK delivers
+    // prior task_requests, but the claim windows on those have long
+    // elapsed. Claimer should reject by ULID-encoded post time, not
+    // emit task_accepts the coord will FK-fail on.
+    const c = makeClient();
+    const reasons: Array<[string, string]> = [];
+    const claimer = createWorkerClaimer({
+      client: c.client,
+      workerDid: 'did:key:wA',
+      config: WORKER_CFG,
+      capability: CAP,
+      channels: ['#swarm'],
+      getPresence: () => 'idle',
+      getInFlight: () => 0,
+      onIneligible: (id, r) => reasons.push([id, r]),
+    });
+    // ULID encoding a time 5 minutes ago. Fixture's claim_window_ms is
+    // 30s, so this is well past expiry.
+    const staleId = ulidAt(Date.now() - 5 * 60_000);
+    claimer(makeRequestEvent(staleId));
+    expect(c.sentLines.length).toBe(0); // no task_accept emitted
+    expect(reasons.length).toBe(1);
+    expect(reasons[0]?.[0]).toBe(staleId);
+    expect(reasons[0]?.[1]).toMatch(/claim window closed/);
   });
 });

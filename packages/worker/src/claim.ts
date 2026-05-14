@@ -13,6 +13,7 @@ import {
   buildCoordinationEvent,
   estimateUsd,
   matchesAnyRepoPattern,
+  decodeTime,
 } from '@freeq-swarm/shared';
 import type { FreeqClient } from '@freeq/sdk';
 
@@ -96,6 +97,20 @@ export function createWorkerClaimer(args: WorkerClaimerArgs): (evt: InboundCoord
     const task = evt.payload as any;
     if (typeof task !== 'object' || task === null) return;
     if (task.kind !== 'swarm.task/v1') return;
+
+    // Freshness gate. eventId is a ULID with the task's post time encoded
+    // in the first 48 bits; the authoritative claim window is in the
+    // payload's policy. Without this, CHATHISTORY-replayed task_requests
+    // trigger task_accept emits for tasks whose windows have long closed.
+    const claimWindowMs = task.policy?.claim_window_ms ?? 30_000;
+    const ageMs = Date.now() - decodeTime(evt.eventId);
+    if (ageMs > claimWindowMs) {
+      args.onIneligible?.(
+        evt.eventId,
+        `claim window closed (${Math.round(ageMs / 1000)}s old, window=${Math.round(claimWindowMs / 1000)}s)`,
+      );
+      return;
+    }
 
     const elig = evaluateEligibility({
       task,

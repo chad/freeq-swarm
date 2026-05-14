@@ -68,6 +68,12 @@ export function startAnnounce(opts: AnnounceOptions): AnnounceHandle {
     }
   };
 
+  // The initial 'ready' event has already fired by the time startAnnounce
+  // is called (connectClient awaits it before returning), so subscribing
+  // alone would miss the first connection's announce — run() would only
+  // execute on a future reconnect. Call run() once inline so the initial
+  // announce always happens, and ALSO subscribe for subsequent reconnects.
+  run();
   opts.client.on('ready', run);
 
   return {
