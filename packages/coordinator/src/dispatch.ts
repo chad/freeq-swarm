@@ -7,6 +7,7 @@ import { createHash } from 'node:crypto';
 import {
   type DidCache,
   type InboundCoordinationEvent,
+  type OperatorAllowlist,
   type Severity,
   type Verdict,
   EVENT_TYPES,
@@ -33,10 +34,10 @@ export interface DispatchDeps {
   didCache?: DidCache;
   /**
    * Operator-DID allowlist. Workers whose advertised operator_did (from the
-   * capabilities table) is not in this list are silently dropped. If
+   * capabilities table) is not in this map are silently dropped. If
    * undefined, the allowlist check is skipped (test mode).
    */
-  operatorAllowlist?: readonly string[];
+  operatorAllowlist?: OperatorAllowlist;
 }
 
 export interface DispatchHandle {
@@ -133,7 +134,7 @@ export function createDispatcher(deps: DispatchDeps): DispatchHandle {
     // ── Security: enforce operator-DID allowlist (via stored capability ad). ──
     if (deps.operatorAllowlist) {
       const cap = deps.db.capabilityFor(workerDid);
-      if (!cap || !deps.operatorAllowlist.includes(cap.operator_did)) return;
+      if (!cap || !deps.operatorAllowlist.has(cap.operator_did)) return;
     }
     // Persist claim (PK ensures dedup across echoes).
     deps.db.recordClaim(taskId, workerDid, Math.floor(Date.now() / 1000));

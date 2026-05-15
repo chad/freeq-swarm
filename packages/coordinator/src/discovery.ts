@@ -3,6 +3,7 @@
 // hints, so the worker can auto-bootstrap with one approval prompt.
 import {
   type CoordinatorConfig,
+  type OperatorAllowlist,
   type SwarmDiscovery,
   type DidCache,
 } from '@freeq-swarm/shared';
@@ -14,6 +15,7 @@ export interface DiscoveryDeps {
   coordinatorDid: string;
   /** For sender-DID resolution. */
   didCache: DidCache;
+  operatorAllowlist: OperatorAllowlist;
   /** Free-form description sent in the discovery payload (optional). */
   description?: string;
 }
@@ -75,7 +77,7 @@ export function handleDiscoveryRequest(
       max_usd_per_task: maxUsdPerTask,
       daily_usd_per_agent: deps.config.budget.daily_usd_per_agent,
     },
-    operator_allowlist_hint: deps.config.operator_allowlist,
+    operator_allowlist_hint: deps.operatorAllowlist.list().map((e) => e.did),
     description: deps.description,
   };
   const json = JSON.stringify(payload);

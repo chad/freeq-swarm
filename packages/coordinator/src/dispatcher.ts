@@ -6,6 +6,7 @@
 import {
   type CoordinatorConfig,
   type DidCache,
+  type OperatorAllowlist,
   EVENT_TYPES,
   buildCoordinationEvent,
   matchesAnyRepoPattern,
@@ -21,6 +22,7 @@ export interface IngestionDeps {
   db: CoordinatorDb;
   config: CoordinatorConfig;
   didCache: DidCache;
+  operatorAllowlist: OperatorAllowlist;
   ghOpts?: GhOptions;
 }
 
@@ -41,7 +43,7 @@ export async function handleInboundPrivmsg(
   deps: IngestionDeps,
   msg: InboundPrivmsg,
 ): Promise<void> {
-  const { client, db, config, didCache } = deps;
+  const { client, db, config, didCache, operatorAllowlist } = deps;
   const channel = config.swarm.channel;
 
   // Ignore messages from ourselves (echo from echo-message cap).
@@ -68,7 +70,7 @@ export async function handleInboundPrivmsg(
   }
 
   // Allowlist gate.
-  if (!config.operator_allowlist.includes(requesterDid)) {
+  if (!operatorAllowlist.has(requesterDid)) {
     notice(
       client,
       msg.from,

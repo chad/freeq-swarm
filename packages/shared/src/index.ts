@@ -4,6 +4,7 @@ export * from './ulid.js';
 export * from './pricing.js';
 export * from './paths.js';
 export * from './policy.js';
+export * from './allowlist.js';
 export * from './did_resolver.js';
 export * from './governance.js';
 export * from './connect.js';

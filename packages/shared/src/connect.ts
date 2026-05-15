@@ -4,8 +4,7 @@
 //
 // bot-kit owns: did:key SASL, PROVENANCE, AGENT REGISTER, PRESENCE, HEARTBEAT,
 // channel JOIN, reconnect re-announce. Swarm-specific concerns (nick collision
-// policy, ws-url derivation from `host:port`, key-filename compat shim) stay
-// here.
+// policy, ws-url derivation from `host:port`, legacy key-file guard) stay here.
 import {
   FreeqBot,
   type AgentIdentity,
@@ -13,6 +12,9 @@ import {
   type FreeqClient,
   type NickCollisionPolicy,
 } from '@freeq/bot-kit';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
+import { access } from 'node:fs/promises';
 
 export type { AgentIdentity, DelegationCert, FreeqClient } from '@freeq/bot-kit';
 
@@ -58,7 +60,37 @@ function deriveUrl(opts: ConnectOptions): string {
   return `wss://${host}/irc`;
 }
 
+/**
+ * Pre-bot-kit swarm wrote the ed25519 seed as `key.ed25519`; bot-kit reads
+ * `agent.key`. If the new name is absent but the legacy one is present,
+ * refuse to start — proceeding would have FreeqBot.create mint a fresh key
+ * and silently change the bot's DID. The fix is one manual `mv`.
+ */
+async function guardLegacyKeyFile(name: string): Promise<void> {
+  const dir = join(homedir(), '.freeq', 'bots', name);
+  const agentKey = join(dir, 'agent.key');
+  const legacyKey = join(dir, 'key.ed25519');
+  const exists = async (p: string): Promise<boolean> => {
+    try {
+      await access(p);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  if (await exists(agentKey)) return; // already on the new name
+  if (!(await exists(legacyKey))) return; // fresh install — nothing to guard
+  throw new Error(
+    `legacy key file detected: ${legacyKey}\n` +
+      `bot-kit reads the ed25519 seed at ${agentKey}.\n` +
+      `Migrate manually:  mv ${legacyKey} ${agentKey}\n` +
+      `Or delete ${legacyKey} to mint a fresh identity (the bot DID will change).`,
+  );
+}
+
 export async function connect(opts: ConnectOptions): Promise<Connected> {
+  await guardLegacyKeyFile(opts.name);
+
   const bot = await FreeqBot.create({
     name: opts.name,
     ownerDid: opts.ownerDid,

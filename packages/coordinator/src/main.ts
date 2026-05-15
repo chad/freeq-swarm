@@ -10,6 +10,7 @@
 import {
   type CoordinatorConfig,
   loadCoordinatorConfig,
+  loadOperatorAllowlist,
   paths,
   ensurePathsDir,
   connect,
@@ -41,7 +42,13 @@ export async function main(opts: CoordinatorOptions = {}): Promise<void> {
 
   await ensurePathsDir(p);
 
-  // ── 2. Open SQLite ──
+  // ── 2. Load operator allowlist (live-read from coordinator.yaml) ──
+  const operatorAllowlist = await loadOperatorAllowlist({ configPath });
+  console.log(
+    `operator allowlist: ${operatorAllowlist.list().length} entr${operatorAllowlist.list().length === 1 ? 'y' : 'ies'} from coordinator.yaml`,
+  );
+
+  // ── 3. Open SQLite ──
   const db = new CoordinatorDb(p.db);
   process.on('exit', () => db.close());
 
@@ -117,12 +124,13 @@ export async function main(opts: CoordinatorOptions = {}): Promise<void> {
         config,
         coordinatorDid: conn.identity.did,
         didCache,
+        operatorAllowlist,
       },
       inb,
     );
     // Channel ingestion: humans posting "@swarm review <pr>".
     void handleInboundPrivmsg(
-      { client: conn.client, db, config, didCache },
+      { client: conn.client, db, config, didCache, operatorAllowlist },
       inb,
     );
   });
@@ -133,7 +141,7 @@ export async function main(opts: CoordinatorOptions = {}): Promise<void> {
     db,
     channel: config.swarm.channel,
     didCache,
-    operatorAllowlist: config.operator_allowlist,
+    operatorAllowlist,
   });
   // Recovery: re-arm timers for any in-flight tasks left over from a previous
   // run BEFORE we wire inbound handlers, so the recovery decisions aren't
@@ -149,6 +157,7 @@ export async function main(opts: CoordinatorOptions = {}): Promise<void> {
     db,
     config,
     didCache,
+    operatorAllowlist,
   });
 
   // ── 13. Clean shutdown ──
