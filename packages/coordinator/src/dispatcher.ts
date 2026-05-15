@@ -5,7 +5,6 @@
 // Wires together: ingest.ts, gh.ts, did_resolver, freeq event helpers.
 import {
   type CoordinatorConfig,
-  type DidCache,
   type OperatorAllowlist,
   EVENT_TYPES,
   buildCoordinationEvent,
@@ -21,7 +20,9 @@ export interface IngestionDeps {
   client: FreeqClient;
   db: CoordinatorDb;
   config: CoordinatorConfig;
-  didCache: DidCache;
+  /** Resolve the requester's DID: account-tag → cache → WHOIS. Delegates
+   *  to bot-kit's resolver (via the connect() adapter). */
+  resolveSenderDid: (msg: { from: string; tags?: Record<string, string> }) => Promise<string | null>;
   operatorAllowlist: OperatorAllowlist;
   ghOpts?: GhOptions;
 }
@@ -33,6 +34,9 @@ export interface InboundPrivmsg {
   from: string;
   /** Message text (trailing parameter). */
   text: string;
+  /** Raw IRCv3 tags from the wire — carries the `account` tag the
+   *  resolver prefers over cache/WHOIS. */
+  tags?: Record<string, string>;
 }
 
 /**
@@ -43,7 +47,7 @@ export async function handleInboundPrivmsg(
   deps: IngestionDeps,
   msg: InboundPrivmsg,
 ): Promise<void> {
-  const { client, db, config, didCache, operatorAllowlist } = deps;
+  const { client, db, config, resolveSenderDid, operatorAllowlist } = deps;
   const channel = config.swarm.channel;
 
   // Ignore messages from ourselves (echo from echo-message cap).
@@ -63,7 +67,8 @@ export async function handleInboundPrivmsg(
   }
 
   // Resolve requester DID (need it for allowlist + audit). PLAN §5.4.
-  const requesterDid = await didCache.resolveNick(msg.from, 3000);
+  // account-tag → cache → WHOIS, via bot-kit's resolver.
+  const requesterDid = await resolveSenderDid({ from: msg.from, tags: msg.tags });
   if (!requesterDid) {
     notice(client, msg.from, `swarm: could not resolve your DID via WHOIS — refusing task.`);
     return;

@@ -50,6 +50,10 @@ export interface Connected {
   nick: string;
   /** Stop heartbeat, send PRESENCE=offline + QUIT, disconnect. Idempotent. */
   stop(reason?: string): Promise<void>;
+  /** Resolve a sender's DID: account-tag → cache → WHOIS (with the
+   *  userRenamed/userQuit cache invalidation bot-kit's resolver provides).
+   *  Returns null if unresolvable within the WHOIS timeout. */
+  resolveSenderDid(msg: { from: string; tags?: Record<string, string> }): Promise<string | null>;
 }
 
 const DEFAULT_TIMEOUT_MS = 30_000;
@@ -111,5 +115,6 @@ export async function connect(opts: ConnectOptions): Promise<Connected> {
     did: bot.identity.did,
     nick: bot.client.nick || opts.nick,
     stop: (reason?: string) => bot.stop(reason ?? 'swarm stop'),
+    resolveSenderDid: (msg) => bot.resolveSenderDid(msg),
   };
 }

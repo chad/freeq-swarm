@@ -296,7 +296,7 @@ describe('SECURITY: CRLF injection', () => {
       summary: { default_tz: 'UTC', default_time: '09:00', per_requester_tz: {} },
     } as any;
     await handleInboundPrivmsg(
-      { client: c.client, db, config, didCache, operatorAllowlist: await operatorAllowlistFromDids(['did:plc:alice']), ghOpts: { ghBin: HAPPY_GH } },
+      { client: c.client, db, config, resolveSenderDid: async (m: { from: string }) => didCache.didForNick(m.from) ?? null, operatorAllowlist: await operatorAllowlistFromDids(['did:plc:alice']), ghOpts: { ghBin: HAPPY_GH } },
       { target: '#swarm', from: 'alice', text: '@swarm review http://x\r\nKICK #swarm victim :pwned' },
     );
     // Any line with \r or \n inside the body is dangerous; assert none of the sent
@@ -331,7 +331,7 @@ describe('SECURITY: CRLF injection', () => {
       summary: { default_tz: 'UTC', default_time: '09:00', per_requester_tz: {} },
     } as any;
     await handleInboundPrivmsg(
-      { client: c.client, db, config, didCache, operatorAllowlist: await operatorAllowlistFromDids(['did:plc:alice']), ghOpts: { ghBin: evilGh } },
+      { client: c.client, db, config, resolveSenderDid: async (m: { from: string }) => didCache.didForNick(m.from) ?? null, operatorAllowlist: await operatorAllowlistFromDids(['did:plc:alice']), ghOpts: { ghBin: evilGh } },
       { target: '#swarm', from: 'alice', text: '@swarm review https://github.com/foo/bar/pull/42' },
     );
     for (const l of c.sentLines) {
@@ -368,7 +368,7 @@ describe('SECURITY: path traversal in repo names', () => {
       summary: { default_tz: 'UTC', default_time: '09:00', per_requester_tz: {} },
     } as any;
     await handleInboundPrivmsg(
-      { client: c.client, db, config, didCache, operatorAllowlist: await operatorAllowlistFromDids(['did:plc:alice']), ghOpts: { ghBin: HAPPY_GH } },
+      { client: c.client, db, config, resolveSenderDid: async (m: { from: string }) => didCache.didForNick(m.from) ?? null, operatorAllowlist: await operatorAllowlistFromDids(['did:plc:alice']), ghOpts: { ghBin: HAPPY_GH } },
       { target: '#swarm', from: 'alice', text: '@swarm review https://github.com/../etc/pull/1' },
     );
     // Should NOT post a task_request whose target contains '..'

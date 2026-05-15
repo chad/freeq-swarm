@@ -62,7 +62,9 @@ async function makeDepsArg(t: Awaited<ReturnType<typeof makeDeps>>, ghBin: strin
     client: t.fakeClient,
     db: t.db,
     config: t.config as any,
-    didCache: t.didCache,
+    // Cache-only resolver backed by the test's didCache (tests set bindings
+    // via t.didCache.set(...)); unknown nick → null, mirroring a WHOIS miss.
+    resolveSenderDid: async (m: { from: string }) => t.didCache.didForNick(m.from) ?? null,
     operatorAllowlist: await operatorAllowlistFromDids(t.config.operator_allowlist),
     ghOpts: { ghBin },
   };

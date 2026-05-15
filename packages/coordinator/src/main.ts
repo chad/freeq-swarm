@@ -116,7 +116,7 @@ export async function main(opts: CoordinatorOptions = {}): Promise<void> {
 
   // ── 10. Wire inbound PRIVMSG handler (Phase 2 ingestion + discovery) ──
   conn.client.on('message', (channel, m) => {
-    const inb = { target: channel, from: m.from ?? '', text: m.text ?? '' };
+    const inb = { target: channel, from: m.from ?? '', text: m.text ?? '', tags: m.tags };
     // Discovery: a candidate worker DMs us "whoareyou".
     handleDiscoveryRequest(
       {
@@ -130,7 +130,7 @@ export async function main(opts: CoordinatorOptions = {}): Promise<void> {
     );
     // Channel ingestion: humans posting "@swarm review <pr>".
     void handleInboundPrivmsg(
-      { client: conn.client, db, config, didCache, operatorAllowlist },
+      { client: conn.client, db, config, resolveSenderDid: conn.resolveSenderDid, operatorAllowlist },
       inb,
     );
   });
