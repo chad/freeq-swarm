@@ -5,6 +5,7 @@
 // Wires together: ingest.ts, gh.ts, did_resolver, freeq event helpers.
 import {
   type CoordinatorConfig,
+  type MentionResult,
   type OperatorAllowlist,
   EVENT_TYPES,
   buildCoordinationEvent,
@@ -14,7 +15,7 @@ import {
 import type { FreeqClient } from '@freeq/sdk';
 import type { CoordinatorDb } from './db.js';
 import { fetchPrHeadInfo, fetchIssue, type GhOptions } from './gh.js';
-import { type ParsedIssueFixSpec, type ParsedReviewSpec, parseTaskCommand, stripAddressing } from './ingest.js';
+import { type ParsedIssueFixSpec, type ParsedReviewSpec, parseTaskCommand } from './ingest.js';
 
 export interface IngestionDeps {
   client: FreeqClient;
@@ -23,6 +24,9 @@ export interface IngestionDeps {
   /** Resolve the requester's DID: account-tag → cache → WHOIS. Delegates
    *  to bot-kit's resolver (via the connect() adapter). */
   resolveSenderDid: (msg: { from: string; tags?: Record<string, string> }) => Promise<string | null>;
+  /** Addressing check (bot-kit's checkMention via connect()). Returns
+   *  `respond` with stripped body when addressed, else `ignore`. */
+  checkMention: (channel: string, text: string) => MentionResult;
   operatorAllowlist: OperatorAllowlist;
   ghOpts?: GhOptions;
 }
@@ -47,7 +51,7 @@ export async function handleInboundPrivmsg(
   deps: IngestionDeps,
   msg: InboundPrivmsg,
 ): Promise<void> {
-  const { client, db, config, resolveSenderDid, operatorAllowlist } = deps;
+  const { client, db, config, resolveSenderDid, checkMention, operatorAllowlist } = deps;
   const channel = config.swarm.channel;
 
   // Ignore messages from ourselves (echo from echo-message cap).
@@ -56,8 +60,9 @@ export async function handleInboundPrivmsg(
   // Only handle messages on our swarm channel (skip DMs for v1).
   if (msg.target !== channel) return;
 
-  const body = stripAddressing(msg.text, config.swarm.coordinator_nick);
-  if (body === null) return; // not addressed to us
+  const mention = checkMention(msg.target, msg.text);
+  if (mention.kind !== 'respond') return; // not addressed (cooldown disabled)
+  const body = mention.stripped;
 
   // Parse the command.
   const parsed = parseTaskCommand(body);

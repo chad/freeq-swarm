@@ -5,6 +5,16 @@ import { join } from 'node:path';
 import { createDidCache, operatorAllowlistFromDids, parseInboundCoordinationEvent, parseTags } from '@freeq-swarm/shared';
 import { CoordinatorDb } from './db.js';
 import { handleInboundPrivmsg } from './dispatcher.js';
+import { stripAddressing } from './ingest.js';
+
+/** Real start-anchored matcher wrapped as bot-kit's checkMention shape
+ *  (cooldown disabled in prod, so only ignore/respond). */
+function stubCheckMention(nick: string) {
+  return (_channel: string, text: string) => {
+    const s = stripAddressing(text, nick);
+    return s === null ? ({ kind: 'ignore' } as const) : ({ kind: 'respond', stripped: s } as const);
+  };
+}
 
 function makeFakeGh(body: string): string {
   const dir = mkdtempSync(join(tmpdir(), 'fake-gh-'));
@@ -65,6 +75,7 @@ async function makeDepsArg(t: Awaited<ReturnType<typeof makeDeps>>, ghBin: strin
     // Cache-only resolver backed by the test's didCache (tests set bindings
     // via t.didCache.set(...)); unknown nick → null, mirroring a WHOIS miss.
     resolveSenderDid: async (m: { from: string }) => t.didCache.didForNick(m.from) ?? null,
+    checkMention: stubCheckMention(t.config.swarm.coordinator_nick),
     operatorAllowlist: await operatorAllowlistFromDids(t.config.operator_allowlist),
     ghOpts: { ghBin },
   };

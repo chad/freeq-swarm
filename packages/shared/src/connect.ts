@@ -10,13 +10,15 @@ import {
   type AgentIdentity,
   type DelegationCert,
   type FreeqClient,
+  type MentionMatcher,
+  type MentionResult,
   type NickCollisionPolicy,
 } from '@freeq/bot-kit';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { access } from 'node:fs/promises';
 
-export type { AgentIdentity, DelegationCert, FreeqClient } from '@freeq/bot-kit';
+export type { AgentIdentity, DelegationCert, FreeqClient, MentionMatcher, MentionResult } from '@freeq/bot-kit';
 
 export interface ConnectOptions {
   /** Bot name under `~/.freeq/bots/`. Swarm uses `swarm-coordinator` / `swarm-worker`. */
@@ -38,6 +40,12 @@ export interface ConnectOptions {
   /** Initial PRESENCE state. Default: `online` (matches the previous swarm
    *  announce-sequence default; bot-kit's own default is `active`). */
   initialPresence?: string;
+  /** Custom addressing matcher (text, liveNick) => stripped | null. Swarm
+   *  passes its start-anchored stripAddressing here; bot-kit's default
+   *  matcher is anywhere-match, which is the wrong policy for the coord.
+   *  When set, the per-channel mention cooldown is disabled (the
+   *  coordinator must process every task request, never rate-limit). */
+  mentionMatcher?: MentionMatcher;
 }
 
 export interface Connected {
@@ -54,6 +62,10 @@ export interface Connected {
    *  userRenamed/userQuit cache invalidation bot-kit's resolver provides).
    *  Returns null if unresolvable within the WHOIS timeout. */
   resolveSenderDid(msg: { from: string; tags?: Record<string, string> }): Promise<string | null>;
+  /** Classify a channel message as addressed-to-the-coordinator using the
+   *  configured matcher + live server nick. cooldown disabled for swarm, so
+   *  the result is only `ignore` or `respond`. */
+  checkMention(channel: string, text: string): MentionResult;
 }
 
 const DEFAULT_TIMEOUT_MS = 30_000;
@@ -104,6 +116,9 @@ export async function connect(opts: ConnectOptions): Promise<Connected> {
     onNickCollision: opts.onNickCollision,
     heartbeatMs: opts.heartbeatMs,
     initialState: opts.initialPresence ?? 'online',
+    ...(opts.mentionMatcher
+      ? { mention: { matcher: opts.mentionMatcher, cooldownMs: 0 } }
+      : {}),
   });
 
   await bot.start({ timeoutMs: opts.readyTimeoutMs ?? DEFAULT_TIMEOUT_MS });
@@ -116,5 +131,6 @@ export async function connect(opts: ConnectOptions): Promise<Connected> {
     nick: bot.client.nick || opts.nick,
     stop: (reason?: string) => bot.stop(reason ?? 'swarm stop'),
     resolveSenderDid: (msg) => bot.resolveSenderDid(msg),
+    checkMention: (channel, text) => bot.checkMention(channel, text),
   };
 }

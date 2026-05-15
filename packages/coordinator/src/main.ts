@@ -19,6 +19,7 @@ import {
 import { CoordinatorDb } from './db.js';
 import { defaultRestBase, fetchBudget, issueBudget } from './budget.js';
 import { handleInboundPrivmsg } from './dispatcher.js';
+import { stripAddressing } from './ingest.js';
 import { createDispatcher } from './dispatch.js';
 import { startSummaryScheduler } from './summary.js';
 import { handleDiscoveryRequest } from './discovery.js';
@@ -68,6 +69,9 @@ export async function main(opts: CoordinatorOptions = {}): Promise<void> {
     channels: [config.swarm.channel],
     onNickCollision: 'refuse',
     readyTimeoutMs: 30_000,
+    // Swarm's start-anchored addressing as the bot-kit mention matcher
+    // (bot-kit's default is anywhere-match — wrong policy for the coord).
+    mentionMatcher: (text, nick) => stripAddressing(text, nick),
   });
   console.log(`coordinator did: ${conn.identity.did}${conn.identity.isFresh ? ' (fresh)' : ''}`);
   console.log(
@@ -130,7 +134,7 @@ export async function main(opts: CoordinatorOptions = {}): Promise<void> {
     );
     // Channel ingestion: humans posting "@swarm review <pr>".
     void handleInboundPrivmsg(
-      { client: conn.client, db, config, resolveSenderDid: conn.resolveSenderDid, operatorAllowlist },
+      { client: conn.client, db, config, resolveSenderDid: conn.resolveSenderDid, checkMention: conn.checkMention, operatorAllowlist },
       inb,
     );
   });
