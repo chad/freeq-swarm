@@ -263,6 +263,12 @@ export const INBOUND_LINE_MAX_BYTES = 16 * 1024;
  * needs to ignore self).
  *
  * Returns an unsubscribe fn.
+ *
+ * Dedup note: `buildCoordinationEvent` emits both TAGMSG and PRIVMSG for
+ * every event (structured + human companion). Both parse, so without a
+ * filter the handler fires twice per logical event. We accept TAGMSG only
+ * — it's the structured carrier; the PRIVMSG is for clients that don't
+ * understand the tags.
  */
 export function subscribeCoordinationEvents(
   client: { on: (event: 'raw', h: (line: string, parsed: any) => void) => void; off: (event: 'raw', h: any) => void },
@@ -274,6 +280,7 @@ export function subscribeCoordinationEvents(
     if (line.length > cap) return; // drop oversized lines silently
     const evt = parseInboundCoordinationEvent(line);
     if (!evt) return;
+    if (evt.verb !== 'TAGMSG') return;
     try {
       handler(evt);
     } catch (e) {

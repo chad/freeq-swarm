@@ -170,6 +170,9 @@ export async function main(opts: WorkerOptions = {}): Promise<void> {
     onClaim: (taskId) => {
       inFlightTasks.add(taskId);
     },
+    onIneligible: (taskId, reason) => {
+      console.log(`skip ${taskId.slice(0, 8)}: ${reason}`);
+    },
   });
   const unsubEvents = subscribeCoordinationEvents(conn.client, (evt) => {
     // Don't accept new claims while not in normal governance state.
@@ -179,6 +182,15 @@ export async function main(opts: WorkerOptions = {}): Promise<void> {
       const a = evt.payload as any;
       if (a?.kind === 'swarm.assignment/v1' && Array.isArray(a.assigned_to)) {
         const tid = a.task_id as string;
+        // CHATHISTORY replay: if the coord's exec deadline has already passed,
+        // the task is dead. Acting on it would strand presence in 'executing'
+        // (no task_payload in cache → workflow never runs → releaseSlot never
+        // called → all subsequent task_requests rejected as idle_only).
+        const deadlineMs = typeof a.deadline_unix === 'number' ? a.deadline_unix * 1000 : 0;
+        if (deadlineMs > 0 && Date.now() > deadlineMs) {
+          console.log(`ignore stale assignment ${tid.slice(0, 8)} (deadline passed)`);
+          return;
+        }
         if (a.assigned_to.includes(identity.did)) {
           setPresence('executing', `working on ${tid.slice(0, 8)}`, tid);
           // Find the source task_request payload from cached state. For v1

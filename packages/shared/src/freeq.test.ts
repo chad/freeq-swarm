@@ -8,6 +8,7 @@ import {
   parseInboundCoordinationEvent,
   parseTags,
   serializeTags,
+  subscribeCoordinationEvents,
   unescapeTagValue,
 } from './freeq.js';
 
@@ -118,5 +119,40 @@ describe('parseInboundCoordinationEvent', () => {
       '@msgid=01;+freeq.at/event=task_update;+freeq.at/ref=01R;+freeq.at/payload=%7B%7D TAGMSG #swarm';
     const parsed = parseInboundCoordinationEvent(line);
     expect(parsed!.taskId).toBe('01R');
+  });
+});
+
+describe('subscribeCoordinationEvents', () => {
+  function makeClient(): { emit: (line: string) => void; client: any } {
+    const handlers: Array<(line: string, parsed: any) => void> = [];
+    return {
+      emit: (line) => handlers.forEach((h) => h(line, null)),
+      client: {
+        on: (_e: 'raw', h: any) => handlers.push(h),
+        off: (_e: 'raw', h: any) => {
+          const i = handlers.indexOf(h);
+          if (i >= 0) handlers.splice(i, 1);
+        },
+      },
+    };
+  }
+
+  it('fires once per logical event — TAGMSG only, drops the PRIVMSG companion', () => {
+    // buildCoordinationEvent emits BOTH a TAGMSG and a PRIVMSG with the same
+    // msgid + tags. Both parse, so without a verb filter the handler fires
+    // twice per logical event. Worker workflows would double-run.
+    const c = makeClient();
+    const calls: string[] = [];
+    const unsub = subscribeCoordinationEvents(c.client, (evt) => {
+      calls.push(`${evt.verb}:${evt.eventType}`);
+    });
+    const evt = buildCoordinationEvent('#swarm', 'task_request', { kind: 'swarm.task/v1' }, {
+      eventId: '01HZ',
+      humanText: '📣 task',
+    });
+    c.emit(evt.tagmsg);
+    c.emit(evt.privmsg);
+    expect(calls).toEqual(['TAGMSG:task_request']);
+    unsub();
   });
 });
