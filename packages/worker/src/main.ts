@@ -7,13 +7,10 @@
 import {
   type WorkerConfig,
   buildCoordinationEvent,
-  loadOrCreateIdentity,
-  loadOrMintDelegation,
   loadWorkerConfig,
   paths,
   ensurePathsDir,
-  startAnnounce,
-  connectClient,
+  connect,
   wireDidCacheToClient,
   subscribeCoordinationEvents,
 } from '@freeq-swarm/shared';
@@ -44,40 +41,26 @@ export async function main(opts: WorkerOptions = {}): Promise<void> {
 
   await ensurePathsDir(p);
 
-  // ── 2. Load identity + delegation ──
-  const identity = await loadOrCreateIdentity(p.agentKey);
-  console.log(`worker did: ${identity.did}${identity.isFresh ? ' (fresh)' : ''}`);
-  const delegation = await loadOrMintDelegation({
-    agent: identity,
+  // ── 2. Connect (bot-kit owns identity load/mint, SASL, announce, JOIN) ──
+  const conn = await connect({
+    name: 'swarm-worker',
     ownerDid: config.worker.owner_did,
-    certPath: p.delegation,
-  });
-  console.log(
-    `delegation: bot=${delegation.bot_did} creator=${delegation.creator_did} signature=${delegation.signature ?? 'null (declarative)'}`,
-  );
-
-  // ── 3. Connect with random-suffix-on-collision ──
-  const conn = await connectClient({
-    identity,
     nick: config.worker.nick_hint,
     server: config.worker.freeq_server,
     url: config.worker.freeq_ws_url,
+    channels: config.worker.swarm_channels,
     onNickCollision: 'random-suffix',
-    maxNickRetries: 3,
     readyTimeoutMs: 30_000,
   });
+  const identity = conn.identity;
+  console.log(`worker did: ${identity.did}${identity.isFresh ? ' (fresh)' : ''}`);
+  console.log(
+    `delegation: bot=${conn.delegation.bot_did} creator=${conn.delegation.creator_did} signature=${conn.delegation.signature ?? 'null (declarative)'}`,
+  );
   console.log(`connected as ${conn.nick} (did=${conn.did})`);
 
-  // ── 4. DID cache ──
+  // ── 3. DID cache ──
   wireDidCacheToClient(conn.client);
-
-  // ── 5. Announce + JOIN ──
-  const handle = startAnnounce({
-    client: conn.client,
-    delegation,
-    channels: config.worker.swarm_channels,
-    initialPresence: 'online',
-  });
 
   // ── 6. Worker presence + in-flight tracking (Phase 3 needs both for eligibility) ──
   let presence: WorkerPresenceState = 'online';
@@ -371,7 +354,7 @@ export async function main(opts: WorkerOptions = {}): Promise<void> {
     clearInterval(capAdTimer);
     unsubEvents();
     govHandle.dispose();
-    await handle.stop(`worker ${sig}`);
+    await conn.stop(`worker ${sig}`);
     process.exit(0);
   };
   process.on('SIGTERM', () => void shutdown('SIGTERM'));

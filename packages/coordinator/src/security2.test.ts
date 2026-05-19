@@ -3,7 +3,7 @@
 import { describe, expect, it } from 'vitest';
 import { CoordinatorDb } from './db.js';
 import { createDispatcher } from './dispatch.js';
-import { createDidCache, newUlid } from '@freeq-swarm/shared';
+import { createDidCache, newUlid, operatorAllowlistFromDids } from '@freeq-swarm/shared';
 
 function workerCache(...dids: string[]) {
   const cache = createDidCache({ whois: () => {}, onMemberDid: () => () => {} });
@@ -259,7 +259,7 @@ describe('SECURITY: unicode / control chars in nicks', () => {
 // ─────────────────────────────────────────────────────────────────────────────
 
 describe('SECURITY: capability ad spoofing', () => {
-  it('N1: cap ad whose source DID does not match worker_did MUST be rejected', () => {
+  it('N1: cap ad whose source DID does not match worker_did MUST be rejected', async () => {
     const db = new CoordinatorDb(':memory:');
     const c = makeClient();
     const sched = fakeScheduler();
@@ -270,7 +270,7 @@ describe('SECURITY: capability ad spoofing', () => {
       channel: '#swarm',
       scheduler: sched.api,
       didCache: cache,
-      operatorAllowlist: ['did:plc:victim-op'],
+      operatorAllowlist: await operatorAllowlistFromDids(['did:plc:victim-op']),
     });
     // Mallory sends a cap ad claiming to be the victim with mallory's operator
     d.handle(inbound('status_update', 'N1', 'mallory!u@h', {
@@ -284,7 +284,7 @@ describe('SECURITY: capability ad spoofing', () => {
     expect(db.capabilityFor('did:key:victim')).toBeNull();
   });
 
-  it('N2: legitimate cap ad from the worker itself IS accepted', () => {
+  it('N2: legitimate cap ad from the worker itself IS accepted', async () => {
     const db = new CoordinatorDb(':memory:');
     const c = makeClient();
     const sched = fakeScheduler();
@@ -295,7 +295,7 @@ describe('SECURITY: capability ad spoofing', () => {
       channel: '#swarm',
       scheduler: sched.api,
       didCache: cache,
-      operatorAllowlist: ['did:plc:alice-op'],
+      operatorAllowlist: await operatorAllowlistFromDids(['did:plc:alice-op']),
     });
     d.handle(inbound('status_update', 'N2', srcFor('did:key:alice'), {
       kind: 'swarm.capabilities/v1',

@@ -9,8 +9,8 @@
 // straight to ~/.freeq-swarm/worker/worker.yaml; otherwise it's printed for
 // the user to review and write themselves.
 import { writeFile } from 'node:fs/promises';
+import { FreeqClient } from '@freeq/sdk';
 import {
-  connectClient,
   ensurePathsDir,
   generateDidKey,
   parseDiscoveryResponse,
@@ -78,18 +78,32 @@ const DEFAULT_TIMEOUT_MS = 10_000;
 export async function discover(opts: DiscoverOptions): Promise<SwarmDiscovery> {
   const out = opts.out ?? process.stdout;
   const coordNick = opts.coordinatorNick ?? 'swarm';
-  // Ephemeral did:key — no persistence, no cert. Discovery is read-only.
+  // Ephemeral did:key — no persistence, no cert. Discovery is read-only,
+  // so we skip bot-kit's FreeqBot (which mints/persists agent.key +
+  // delegation.json) and drive a bare FreeqClient with SASL directly.
   const didKey = await generateDidKey();
-  const ephemeralIdentity = { did: didKey.did, didKey, isFresh: true };
-
-  const conn = await connectClient({
-    identity: ephemeralIdentity,
-    nick: `discover-${Math.floor(Math.random() * 1_000_000).toString(36)}`,
-    server: opts.server ?? 'irc.freeq.at:6697',
-    url: opts.url,
-    onNickCollision: 'random-suffix',
-    maxNickRetries: 3,
+  const host = (opts.server ?? 'irc.freeq.at:6697').split(':')[0];
+  const url = opts.url ?? `wss://${host}/irc`;
+  const nick = `discover-${Math.floor(Math.random() * 1_000_000).toString(36)}`;
+  const client = new FreeqClient({
+    url,
+    nick,
+    sasl: { did: didKey.did, method: 'crypto', signer: didKey.signer, token: '', pdsUrl: '' },
+    autoMsgSig: false,
   });
+  await new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`timeout waiting for ready (30s)`)), 30_000);
+    client.once('ready', () => {
+      clearTimeout(timer);
+      resolve();
+    });
+    client.once('authError', (msg) => {
+      clearTimeout(timer);
+      reject(new Error(`SASL auth failed: ${msg}`));
+    });
+    client.connect();
+  });
+  const conn = { client, disconnect: () => client.disconnect() };
 
   // Ask the coordinator. We listen on `raw` for the response.
   const payload = await new Promise<SwarmDiscovery>((resolve, reject) => {

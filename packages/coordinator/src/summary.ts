@@ -3,7 +3,7 @@
 // Per requester DID: at the configured local time (default 09:00 in
 // summary.default_tz), build a summary of last-24h activity and send it
 // as PRIVMSG to the requester's last-known nick.
-import type { CoordinatorConfig, DidCache } from '@freeq-swarm/shared';
+import type { CoordinatorConfig, DidCache, OperatorAllowlist } from '@freeq-swarm/shared';
 import type { CoordinatorDb, TaskRow } from './db.js';
 import type { FreeqClient } from '@freeq/sdk';
 
@@ -12,6 +12,7 @@ export interface SummaryDeps {
   db: CoordinatorDb;
   config: CoordinatorConfig;
   didCache: DidCache;
+  operatorAllowlist: OperatorAllowlist;
   /** Test override for `now`. */
   now?: () => Date;
   /** Test override for setTimeout/clearTimeout. */
@@ -194,8 +195,8 @@ export function startSummaryScheduler(deps: SummaryDeps): SummaryHandle {
   };
 
   // Arm for each operator-allowlist DID by default.
-  for (const did of deps.config.operator_allowlist) {
-    armForRequester(did);
+  for (const entry of deps.operatorAllowlist.list()) {
+    armForRequester(entry.did);
   }
 
   async function sendNow(requesterDid: string): Promise<void> {

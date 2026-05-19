@@ -2,9 +2,19 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, writeFileSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { createDidCache, parseInboundCoordinationEvent, parseTags } from '@freeq-swarm/shared';
+import { createDidCache, operatorAllowlistFromDids, parseInboundCoordinationEvent, parseTags } from '@freeq-swarm/shared';
 import { CoordinatorDb } from './db.js';
 import { handleInboundPrivmsg } from './dispatcher.js';
+import { stripAddressing } from './ingest.js';
+
+/** Real start-anchored matcher wrapped as bot-kit's checkMention shape
+ *  (cooldown disabled in prod, so only ignore/respond). */
+function stubCheckMention(nick: string) {
+  return (_channel: string, text: string) => {
+    const s = stripAddressing(text, nick);
+    return s === null ? ({ kind: 'ignore' } as const) : ({ kind: 'respond', stripped: s } as const);
+  };
+}
 
 function makeFakeGh(body: string): string {
   const dir = mkdtempSync(join(tmpdir(), 'fake-gh-'));
@@ -57,11 +67,25 @@ function makeDeps() {
   return { sentLines, fakeClient, config, db, didCache };
 }
 
+async function makeDepsArg(t: Awaited<ReturnType<typeof makeDeps>>, ghBin: string) {
+  return {
+    client: t.fakeClient,
+    db: t.db,
+    config: t.config as any,
+    // Cache-only resolver backed by the test's didCache (tests set bindings
+    // via t.didCache.set(...)); unknown nick → null, mirroring a WHOIS miss.
+    resolveSenderDid: async (m: { from: string }) => t.didCache.didForNick(m.from) ?? null,
+    checkMention: stubCheckMention(t.config.swarm.coordinator_nick),
+    operatorAllowlist: await operatorAllowlistFromDids(t.config.operator_allowlist),
+    ghOpts: { ghBin },
+  };
+}
+
 describe('handleInboundPrivmsg', () => {
   it('ignores messages not addressed to coordinator', async () => {
     const t = makeDeps();
     await handleInboundPrivmsg(
-      { client: t.fakeClient, db: t.db, config: t.config as any, didCache: t.didCache, ghOpts: { ghBin: SUCCESS_GH } },
+      await makeDepsArg(t, SUCCESS_GH),
       { target: '#swarm', from: 'alice', text: 'hello world' },
     );
     expect(t.sentLines).toHaveLength(0);
@@ -70,7 +94,7 @@ describe('handleInboundPrivmsg', () => {
   it('ignores DMs (Phase 2 only handles channel msgs)', async () => {
     const t = makeDeps();
     await handleInboundPrivmsg(
-      { client: t.fakeClient, db: t.db, config: t.config as any, didCache: t.didCache, ghOpts: { ghBin: SUCCESS_GH } },
+      await makeDepsArg(t, SUCCESS_GH),
       { target: 'swarm', from: 'alice', text: '@swarm review https://github.com/foo/bar/pull/42' },
     );
     expect(t.sentLines).toHaveLength(0);
@@ -80,7 +104,7 @@ describe('handleInboundPrivmsg', () => {
     const t = makeDeps();
     t.didCache.set('alice', 'did:plc:alice');
     await handleInboundPrivmsg(
-      { client: t.fakeClient, db: t.db, config: t.config as any, didCache: t.didCache, ghOpts: { ghBin: SUCCESS_GH } },
+      await makeDepsArg(t, SUCCESS_GH),
       { target: '#swarm', from: 'alice', text: '@swarm summarize https://x' },
     );
     expect(t.sentLines.some((l) => l.startsWith('NOTICE alice'))).toBe(true);
@@ -90,7 +114,7 @@ describe('handleInboundPrivmsg', () => {
     const t = makeDeps();
     // No did set for "alice"; cache will WHOIS-then-timeout.
     await handleInboundPrivmsg(
-      { client: t.fakeClient, db: t.db, config: t.config as any, didCache: t.didCache, ghOpts: { ghBin: SUCCESS_GH } },
+      await makeDepsArg(t, SUCCESS_GH),
       { target: '#swarm', from: 'alice', text: '@swarm review https://github.com/foo/bar/pull/42' },
     );
     expect(t.sentLines.some((l) => /could not resolve/.test(l))).toBe(true);
@@ -100,7 +124,7 @@ describe('handleInboundPrivmsg', () => {
     const t = makeDeps();
     t.didCache.set('mallory', 'did:plc:mallory'); // not in allowlist
     await handleInboundPrivmsg(
-      { client: t.fakeClient, db: t.db, config: t.config as any, didCache: t.didCache, ghOpts: { ghBin: SUCCESS_GH } },
+      await makeDepsArg(t, SUCCESS_GH),
       { target: '#swarm', from: 'mallory', text: '@swarm review https://github.com/foo/bar/pull/42' },
     );
     expect(t.sentLines.some((l) => /not in the operator allowlist/.test(l))).toBe(true);
@@ -110,7 +134,7 @@ describe('handleInboundPrivmsg', () => {
     const t = makeDeps();
     t.didCache.set('alice', 'did:plc:alice');
     await handleInboundPrivmsg(
-      { client: t.fakeClient, db: t.db, config: t.config as any, didCache: t.didCache, ghOpts: { ghBin: SUCCESS_GH } },
+      await makeDepsArg(t, SUCCESS_GH),
       { target: '#swarm', from: 'alice', text: '@swarm review https://github.com/random-owner/repo/pull/1' },
     );
     expect(t.sentLines.some((l) => /does not match any allowed pattern/.test(l))).toBe(true);
@@ -120,7 +144,7 @@ describe('handleInboundPrivmsg', () => {
     const t = makeDeps();
     t.didCache.set('alice', 'did:plc:alice');
     await handleInboundPrivmsg(
-      { client: t.fakeClient, db: t.db, config: t.config as any, didCache: t.didCache, ghOpts: { ghBin: SUCCESS_GH } },
+      await makeDepsArg(t, SUCCESS_GH),
       { target: '#swarm', from: 'alice', text: '@swarm review https://github.com/foo/bar/pull/42' },
     );
     // Expect a TAGMSG and a PRIVMSG with task_request event.
@@ -142,7 +166,7 @@ describe('handleInboundPrivmsg', () => {
     const t = makeDeps();
     t.didCache.set('alice', 'did:plc:alice');
     await handleInboundPrivmsg(
-      { client: t.fakeClient, db: t.db, config: t.config as any, didCache: t.didCache, ghOpts: { ghBin: NOT_FOUND_GH } },
+      await makeDepsArg(t, NOT_FOUND_GH),
       { target: '#swarm', from: 'alice', text: '@swarm review https://github.com/foo/bar/pull/42' },
     );
     const evtLines = t.sentLines.filter((l) => /\+freeq\.at\/event=task_failed/.test(l));
@@ -157,7 +181,7 @@ describe('handleInboundPrivmsg', () => {
     const t = makeDeps();
     t.didCache.set('alice', 'did:plc:alice');
     await handleInboundPrivmsg(
-      { client: t.fakeClient, db: t.db, config: t.config as any, didCache: t.didCache, ghOpts: { ghBin: AUTH_ERR_GH } },
+      await makeDepsArg(t, AUTH_ERR_GH),
       { target: '#swarm', from: 'alice', text: '@swarm review https://github.com/foo/bar/pull/42' },
     );
     const tagmsg = t.sentLines.find((l) => /event=task_failed/.test(l) && / TAGMSG /.test(l))!;
@@ -169,7 +193,7 @@ describe('handleInboundPrivmsg', () => {
     const t = makeDeps();
     t.didCache.set('alice', 'did:plc:alice');
     await handleInboundPrivmsg(
-      { client: t.fakeClient, db: t.db, config: t.config as any, didCache: t.didCache, ghOpts: { ghBin: SUCCESS_GH } },
+      await makeDepsArg(t, SUCCESS_GH),
       { target: '#swarm', from: 'alice', text: '@swarm review https://github.com/foo/bar/pull/42 reviewers=3' },
     );
     const tagmsg = t.sentLines.find((l) => /event=task_request/.test(l) && / TAGMSG /.test(l))!;
@@ -180,7 +204,7 @@ describe('handleInboundPrivmsg', () => {
   it('ignores echo from coordinator nick (echo-message cap)', async () => {
     const t = makeDeps();
     await handleInboundPrivmsg(
-      { client: t.fakeClient, db: t.db, config: t.config as any, didCache: t.didCache, ghOpts: { ghBin: SUCCESS_GH } },
+      await makeDepsArg(t, SUCCESS_GH),
       { target: '#swarm', from: 'swarm', text: '@swarm review https://github.com/foo/bar/pull/42' },
     );
     expect(t.sentLines).toHaveLength(0);

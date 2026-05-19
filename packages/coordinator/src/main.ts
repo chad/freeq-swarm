@@ -9,18 +9,17 @@
 // Phase 1 lands steps 1–5 plus the announce sequence and BUDGET issuance.
 import {
   type CoordinatorConfig,
-  loadOrCreateIdentity,
-  loadOrMintDelegation,
   loadCoordinatorConfig,
+  loadOperatorAllowlist,
   paths,
   ensurePathsDir,
-  startAnnounce,
-  connectClient,
+  connect,
   wireDidCacheToClient,
 } from '@freeq-swarm/shared';
 import { CoordinatorDb } from './db.js';
 import { defaultRestBase, fetchBudget, issueBudget } from './budget.js';
 import { handleInboundPrivmsg } from './dispatcher.js';
+import { stripAddressing } from './ingest.js';
 import { createDispatcher } from './dispatch.js';
 import { startSummaryScheduler } from './summary.js';
 import { handleDiscoveryRequest } from './discovery.js';
@@ -44,40 +43,43 @@ export async function main(opts: CoordinatorOptions = {}): Promise<void> {
 
   await ensurePathsDir(p);
 
-  // ── 2. Load identity + delegation cert (mint if missing) ──
-  const identity = await loadOrCreateIdentity(p.agentKey);
-  console.log(`coordinator did: ${identity.did}${identity.isFresh ? ' (fresh)' : ''}`);
-  const delegation = await loadOrMintDelegation({
-    agent: identity,
-    ownerDid: config.swarm.founder_did,
-    certPath: p.delegation,
-  });
+  // ── 2. Load operator allowlist (live-read from coordinator.yaml) ──
+  const operatorAllowlist = await loadOperatorAllowlist({ configPath });
   console.log(
-    `delegation: bot=${delegation.bot_did} creator=${delegation.creator_did} signature=${delegation.signature ?? 'null (declarative)'}`,
+    `operator allowlist: ${operatorAllowlist.list().length} entr${operatorAllowlist.list().length === 1 ? 'y' : 'ies'} from coordinator.yaml`,
   );
 
   // ── 3. Open SQLite ──
   const db = new CoordinatorDb(p.db);
   process.on('exit', () => db.close());
 
-  // ── 4. Recovery scan (placeholder for Phase 5; just log existing in-flight count) ──
+  // ── 3. Recovery scan (placeholder for Phase 5; just log existing in-flight count) ──
   const inflight = db.inFlightTasks();
   if (inflight.length > 0) {
     console.log(`recovery: ${inflight.length} in-flight task(s) found`);
   }
 
-  // ── 5. Connect to freeq with SASL + 433 refuse ──
-  const conn = await connectClient({
-    identity,
+  // ── 4. Connect (bot-kit owns identity load/mint, SASL, announce, JOIN) ──
+  const conn = await connect({
+    name: 'swarm-coordinator',
+    ownerDid: config.swarm.founder_did,
     nick: config.swarm.coordinator_nick,
     server: config.swarm.freeq_server,
     url: config.swarm.freeq_ws_url,
+    channels: [config.swarm.channel],
     onNickCollision: 'refuse',
     readyTimeoutMs: 30_000,
+    // Swarm's start-anchored addressing as the bot-kit mention matcher
+    // (bot-kit's default is anywhere-match — wrong policy for the coord).
+    mentionMatcher: (text, nick) => stripAddressing(text, nick),
   });
+  console.log(`coordinator did: ${conn.identity.did}${conn.identity.isFresh ? ' (fresh)' : ''}`);
+  console.log(
+    `delegation: bot=${conn.delegation.bot_did} creator=${conn.delegation.creator_did} signature=${conn.delegation.signature ?? 'null (declarative)'}`,
+  );
   console.log(`connected as ${conn.nick} (did=${conn.did})`);
 
-  // ── 6. Wire DID cache (ephemeral + persisted) ──
+  // ── 5. Wire DID cache (ephemeral + persisted) ──
   const { cache: didCache } = wireDidCacheToClient(conn.client);
   // Persist every newly-learned binding to SQLite for durable DID→nick lookups.
   conn.client.on('memberDid', (nick, did) => {
@@ -87,14 +89,6 @@ export async function main(opts: CoordinatorOptions = {}): Promise<void> {
   for (const { did, nick } of db.loadDidNickPairs()) {
     didCache.set(nick, did);
   }
-
-  // ── 7. Run announce sequence + JOIN swarm channel ──
-  const handle = startAnnounce({
-    client: conn.client,
-    delegation,
-    channels: [config.swarm.channel],
-    initialPresence: 'online',
-  });
 
   // ── 8. Issue BUDGET on startup if not already set ──
   // We always issue; BUDGET is idempotent (server overwrites). Coordinator does
@@ -126,20 +120,21 @@ export async function main(opts: CoordinatorOptions = {}): Promise<void> {
 
   // ── 10. Wire inbound PRIVMSG handler (Phase 2 ingestion + discovery) ──
   conn.client.on('message', (channel, m) => {
-    const inb = { target: channel, from: m.from ?? '', text: m.text ?? '' };
+    const inb = { target: channel, from: m.from ?? '', text: m.text ?? '', tags: m.tags };
     // Discovery: a candidate worker DMs us "whoareyou".
     handleDiscoveryRequest(
       {
         client: conn.client,
         config,
-        coordinatorDid: identity.did,
+        coordinatorDid: conn.identity.did,
         didCache,
+        operatorAllowlist,
       },
       inb,
     );
     // Channel ingestion: humans posting "@swarm review <pr>".
     void handleInboundPrivmsg(
-      { client: conn.client, db, config, didCache },
+      { client: conn.client, db, config, resolveSenderDid: conn.resolveSenderDid, checkMention: conn.checkMention, operatorAllowlist },
       inb,
     );
   });
@@ -150,7 +145,7 @@ export async function main(opts: CoordinatorOptions = {}): Promise<void> {
     db,
     channel: config.swarm.channel,
     didCache,
-    operatorAllowlist: config.operator_allowlist,
+    operatorAllowlist,
   });
   // Recovery: re-arm timers for any in-flight tasks left over from a previous
   // run BEFORE we wire inbound handlers, so the recovery decisions aren't
@@ -166,6 +161,7 @@ export async function main(opts: CoordinatorOptions = {}): Promise<void> {
     db,
     config,
     didCache,
+    operatorAllowlist,
   });
 
   // ── 13. Clean shutdown ──
@@ -174,7 +170,7 @@ export async function main(opts: CoordinatorOptions = {}): Promise<void> {
     dispatcher.shutdown();
     summary.shutdown();
     unsubEvents();
-    await handle.stop(`coordinator ${sig}`);
+    await conn.stop(`coordinator ${sig}`);
     db.close();
     process.exit(0);
   };

@@ -16,7 +16,13 @@ import { describe, expect, it } from 'vitest';
 import { CoordinatorDb } from './db.js';
 import { createDispatcher } from './dispatch.js';
 import { handleInboundPrivmsg } from './dispatcher.js';
-import { createDidCache, parseInboundCoordinationEvent } from '@freeq-swarm/shared';
+import { stripAddressing } from './ingest.js';
+
+const checkMention = (_channel: string, text: string) => {
+  const s = stripAddressing(text, 'swarm');
+  return s === null ? ({ kind: 'ignore' } as const) : ({ kind: 'respond', stripped: s } as const);
+};
+import { createDidCache, operatorAllowlistFromDids, parseInboundCoordinationEvent } from '@freeq-swarm/shared';
 import { mkdtempSync, writeFileSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -233,7 +239,7 @@ describe('SECURITY: sender impersonation', () => {
 // ─────────────────────────────────────────────────────────────────────────────
 
 describe('SECURITY: operator-DID allowlist on workers', () => {
-  it('B1: dispatcher MUST reject task_accept from a worker whose operator_did is not allowlisted', () => {
+  it('B1: dispatcher MUST reject task_accept from a worker whose operator_did is not allowlisted', async () => {
     const db = new CoordinatorDb(':memory:');
     seedTask(db, 'B1', 1);
     db.upsertCapability({
@@ -259,7 +265,7 @@ describe('SECURITY: operator-DID allowlist on workers', () => {
       channel: '#swarm',
       scheduler: sched.api,
       didCache,
-      operatorAllowlist: ['did:plc:approved-op'],
+      operatorAllowlist: await operatorAllowlistFromDids(['did:plc:approved-op']),
     });
     d.handle(inbound('task_request', 'B1', 'self!u@h', {}));
     d.handle(inbound('task_accept', 'A1', 'rogue!u@h', { kind: 'swarm.claim/v1', task_id: 'B1', worker_did: 'did:key:rogue' }, 'B1'));
@@ -296,7 +302,7 @@ describe('SECURITY: CRLF injection', () => {
       summary: { default_tz: 'UTC', default_time: '09:00', per_requester_tz: {} },
     } as any;
     await handleInboundPrivmsg(
-      { client: c.client, db, config, didCache, ghOpts: { ghBin: HAPPY_GH } },
+      { client: c.client, db, config, resolveSenderDid: async (m: { from: string }) => didCache.didForNick(m.from) ?? null, checkMention, operatorAllowlist: await operatorAllowlistFromDids(['did:plc:alice']), ghOpts: { ghBin: HAPPY_GH } },
       { target: '#swarm', from: 'alice', text: '@swarm review http://x\r\nKICK #swarm victim :pwned' },
     );
     // Any line with \r or \n inside the body is dangerous; assert none of the sent
@@ -331,7 +337,7 @@ describe('SECURITY: CRLF injection', () => {
       summary: { default_tz: 'UTC', default_time: '09:00', per_requester_tz: {} },
     } as any;
     await handleInboundPrivmsg(
-      { client: c.client, db, config, didCache, ghOpts: { ghBin: evilGh } },
+      { client: c.client, db, config, resolveSenderDid: async (m: { from: string }) => didCache.didForNick(m.from) ?? null, checkMention, operatorAllowlist: await operatorAllowlistFromDids(['did:plc:alice']), ghOpts: { ghBin: evilGh } },
       { target: '#swarm', from: 'alice', text: '@swarm review https://github.com/foo/bar/pull/42' },
     );
     for (const l of c.sentLines) {
@@ -368,7 +374,7 @@ describe('SECURITY: path traversal in repo names', () => {
       summary: { default_tz: 'UTC', default_time: '09:00', per_requester_tz: {} },
     } as any;
     await handleInboundPrivmsg(
-      { client: c.client, db, config, didCache, ghOpts: { ghBin: HAPPY_GH } },
+      { client: c.client, db, config, resolveSenderDid: async (m: { from: string }) => didCache.didForNick(m.from) ?? null, checkMention, operatorAllowlist: await operatorAllowlistFromDids(['did:plc:alice']), ghOpts: { ghBin: HAPPY_GH } },
       { target: '#swarm', from: 'alice', text: '@swarm review https://github.com/../etc/pull/1' },
     );
     // Should NOT post a task_request whose target contains '..'

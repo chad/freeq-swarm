@@ -5,7 +5,8 @@
 // Wires together: ingest.ts, gh.ts, did_resolver, freeq event helpers.
 import {
   type CoordinatorConfig,
-  type DidCache,
+  type MentionResult,
+  type OperatorAllowlist,
   EVENT_TYPES,
   buildCoordinationEvent,
   matchesAnyRepoPattern,
@@ -14,13 +15,19 @@ import {
 import type { FreeqClient } from '@freeq/sdk';
 import type { CoordinatorDb } from './db.js';
 import { fetchPrHeadInfo, fetchIssue, type GhOptions } from './gh.js';
-import { type ParsedIssueFixSpec, type ParsedReviewSpec, parseTaskCommand, stripAddressing } from './ingest.js';
+import { type ParsedIssueFixSpec, type ParsedReviewSpec, parseTaskCommand } from './ingest.js';
 
 export interface IngestionDeps {
   client: FreeqClient;
   db: CoordinatorDb;
   config: CoordinatorConfig;
-  didCache: DidCache;
+  /** Resolve the requester's DID: account-tag → cache → WHOIS. Delegates
+   *  to bot-kit's resolver (via the connect() adapter). */
+  resolveSenderDid: (msg: { from: string; tags?: Record<string, string> }) => Promise<string | null>;
+  /** Addressing check (bot-kit's checkMention via connect()). Returns
+   *  `respond` with stripped body when addressed, else `ignore`. */
+  checkMention: (channel: string, text: string) => MentionResult;
+  operatorAllowlist: OperatorAllowlist;
   ghOpts?: GhOptions;
 }
 
@@ -31,6 +38,9 @@ export interface InboundPrivmsg {
   from: string;
   /** Message text (trailing parameter). */
   text: string;
+  /** Raw IRCv3 tags from the wire — carries the `account` tag the
+   *  resolver prefers over cache/WHOIS. */
+  tags?: Record<string, string>;
 }
 
 /**
@@ -41,7 +51,7 @@ export async function handleInboundPrivmsg(
   deps: IngestionDeps,
   msg: InboundPrivmsg,
 ): Promise<void> {
-  const { client, db, config, didCache } = deps;
+  const { client, db, config, resolveSenderDid, checkMention, operatorAllowlist } = deps;
   const channel = config.swarm.channel;
 
   // Ignore messages from ourselves (echo from echo-message cap).
@@ -50,8 +60,9 @@ export async function handleInboundPrivmsg(
   // Only handle messages on our swarm channel (skip DMs for v1).
   if (msg.target !== channel) return;
 
-  const body = stripAddressing(msg.text, config.swarm.coordinator_nick);
-  if (body === null) return; // not addressed to us
+  const mention = checkMention(msg.target, msg.text);
+  if (mention.kind !== 'respond') return; // not addressed (cooldown disabled)
+  const body = mention.stripped;
 
   // Parse the command.
   const parsed = parseTaskCommand(body);
@@ -61,14 +72,15 @@ export async function handleInboundPrivmsg(
   }
 
   // Resolve requester DID (need it for allowlist + audit). PLAN §5.4.
-  const requesterDid = await didCache.resolveNick(msg.from, 3000);
+  // account-tag → cache → WHOIS, via bot-kit's resolver.
+  const requesterDid = await resolveSenderDid({ from: msg.from, tags: msg.tags });
   if (!requesterDid) {
     notice(client, msg.from, `swarm: could not resolve your DID via WHOIS — refusing task.`);
     return;
   }
 
   // Allowlist gate.
-  if (!config.operator_allowlist.includes(requesterDid)) {
+  if (!operatorAllowlist.has(requesterDid)) {
     notice(
       client,
       msg.from,

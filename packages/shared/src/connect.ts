@@ -1,38 +1,71 @@
-// Higher-level connect: SASL ATPROTO-CHALLENGE, autoMsgSig=false, and
-// hard-edge guards for nick collision (refuse-on-coordinator) and SASL failure.
+// FreeqBot adapter. Replaces the hand-rolled
+// `loadOrCreateIdentity + loadOrMintDelegation + connectClient + startAnnounce`
+// four-step with a single `connect()` that delegates to @freeq/bot-kit.
 //
-// PLAN §6 (autoMsgSig=false, server-side fallback signing).
-// PLAN §4.6 (nick collision policy).
-// PLAN F-16 (subscribe to authError → exit).
-import { FreeqClient } from '@freeq/sdk';
-import type { AgentIdentity } from './identity.js';
+// bot-kit owns: did:key SASL, PROVENANCE, AGENT REGISTER, PRESENCE, HEARTBEAT,
+// channel JOIN, reconnect re-announce. Swarm-specific concerns (nick collision
+// policy, ws-url derivation from `host:port`, legacy key-file guard) stay here.
+import {
+  FreeqBot,
+  type AgentIdentity,
+  type DelegationCert,
+  type FreeqClient,
+  type MentionMatcher,
+  type MentionResult,
+  type NickCollisionPolicy,
+} from '@freeq/bot-kit';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
+import { access } from 'node:fs/promises';
+
+export type { AgentIdentity, DelegationCert, FreeqClient, MentionMatcher, MentionResult } from '@freeq/bot-kit';
 
 export interface ConnectOptions {
-  identity: AgentIdentity;
+  /** Bot name under `~/.freeq/bots/`. Swarm uses `swarm-coordinator` / `swarm-worker`. */
+  name: string;
+  /** Founder/owner DID — used only if delegation.json must be minted. */
+  ownerDid: string;
+  /** Requested IRC nick. Server may rename us (ghost reclaim). */
   nick: string;
-  /** Defaults to `wss://<host>/irc` derived from `server` when unset. */
+  /** Channels to JOIN after announce. */
+  channels: string[];
+  /** Full WebSocket URL. Takes precedence over `server`. */
   url?: string;
-  /** Format `host:port` (TLS port). Used to derive default URL. */
+  /** `host:port` (TLS); derives `wss://<host>/irc`. */
   server?: string;
-  /**
-   * Behavior on `433 ERR_NICKNAMEINUSE` for the requested nick:
-   *  - `refuse` (coordinator default): disconnect + reject.
-   *  - `random-suffix` (worker default): pick a fresh suffix and try again.
-   *    On exhaustion of `maxRetries` (default 3), reject.
-   */
-  onNickCollision?: 'refuse' | 'random-suffix';
-  maxNickRetries?: number;
-  /** Maximum time to wait for `'ready'`. Default 30_000. */
+  /** Default: `refuse` (coordinator). Workers use `random-suffix`. */
+  onNickCollision?: NickCollisionPolicy;
   readyTimeoutMs?: number;
+  heartbeatMs?: number;
+  /** Initial PRESENCE state. Default: `online` (matches the previous swarm
+   *  announce-sequence default; bot-kit's own default is `active`). */
+  initialPresence?: string;
+  /** Custom addressing matcher (text, liveNick) => stripped | null. Swarm
+   *  passes its start-anchored stripAddressing here; bot-kit's default
+   *  matcher is anywhere-match, which is the wrong policy for the coord.
+   *  When set, the per-channel mention cooldown is disabled (the
+   *  coordinator must process every task request, never rate-limit). */
+  mentionMatcher?: MentionMatcher;
 }
 
 export interface Connected {
   client: FreeqClient;
-  /** The DID we authenticated as. */
+  identity: AgentIdentity;
+  delegation: DelegationCert;
+  /** Agent DID (alias for `identity.did`). */
   did: string;
-  /** The nick the server registered us with. */
+  /** Nick the server registered us with (may differ from requested). */
   nick: string;
-  disconnect(): void;
+  /** Stop heartbeat, send PRESENCE=offline + QUIT, disconnect. Idempotent. */
+  stop(reason?: string): Promise<void>;
+  /** Resolve a sender's DID: account-tag → cache → WHOIS (with the
+   *  userRenamed/userQuit cache invalidation bot-kit's resolver provides).
+   *  Returns null if unresolvable within the WHOIS timeout. */
+  resolveSenderDid(msg: { from: string; tags?: Record<string, string> }): Promise<string | null>;
+  /** Classify a channel message as addressed-to-the-coordinator using the
+   *  configured matcher + live server nick. cooldown disabled for swarm, so
+   *  the result is only `ignore` or `respond`. */
+  checkMention(channel: string, text: string): MentionResult;
 }
 
 const DEFAULT_TIMEOUT_MS = 30_000;
@@ -43,133 +76,61 @@ function deriveUrl(opts: ConnectOptions): string {
   return `wss://${host}/irc`;
 }
 
-function randomNickSuffix(): string {
-  return Math.floor(1000 + Math.random() * 9000).toString();
-}
-
 /**
- * Connect, perform SASL, wait for `'ready'`. Caller is responsible for
- * starting the announce sequence (PROVENANCE/...) — we don't bundle them
- * because tests want to assert each step independently.
+ * Pre-bot-kit swarm wrote the ed25519 seed as `key.ed25519`; bot-kit reads
+ * `agent.key`. If the new name is absent but the legacy one is present,
+ * refuse to start — proceeding would have FreeqBot.create mint a fresh key
+ * and silently change the bot's DID. The fix is one manual `mv`.
  */
-export async function connectClient(opts: ConnectOptions): Promise<Connected> {
-  const url = deriveUrl(opts);
-  const onCollision = opts.onNickCollision ?? 'refuse';
-  const maxRetries = opts.maxNickRetries ?? 3;
-  const timeoutMs = opts.readyTimeoutMs ?? DEFAULT_TIMEOUT_MS;
-
-  let attemptNick = opts.nick;
-  let retriesLeft = maxRetries;
-
-  // Outer loop on collision when policy = random-suffix.
-  // We re-create the client on each retry because the SDK's 433 handler
-  // auto-suffixes with `_` which we want to override.
-  for (;;) {
-    const client = new FreeqClient({
-      url,
-      nick: attemptNick,
-      sasl: {
-        did: opts.identity.did,
-        method: 'crypto',
-        signer: opts.identity.didKey.signer,
-        token: '',
-        pdsUrl: '',
-      },
-      autoMsgSig: false,
-    });
-
-    let collision = false;
-    let collisionMessage = '';
-
-    // 433 = ERR_NICKNAMEINUSE. params[1] is the rejected nick.
-    const onRaw = (line: string, parsed: any): void => {
-      if (parsed?.command !== '433') return;
-      const rejected = parsed?.params?.[1];
-      if (rejected !== attemptNick) return;
-      collision = true;
-      collisionMessage = `nick \`${attemptNick}\` is already taken on this server.`;
-      // Best-effort: disconnect now to short-circuit the SDK's `_`-suffix retry.
-      try {
-        client.disconnect();
-      } catch {
-        /* ignore */
-      }
-    };
-    client.on('raw', onRaw);
-
+async function guardLegacyKeyFile(name: string): Promise<void> {
+  const dir = join(homedir(), '.freeq', 'bots', name);
+  const agentKey = join(dir, 'agent.key');
+  const legacyKey = join(dir, 'key.ed25519');
+  const exists = async (p: string): Promise<boolean> => {
     try {
-      const result = await waitForReady(client, attemptNick, opts.identity.did, timeoutMs);
-      client.off('raw', onRaw);
-      return result;
-    } catch (err) {
-      client.off('raw', onRaw);
-      if (collision) {
-        if (onCollision === 'refuse') {
-          throw new Error(collisionMessage);
-        }
-        // random-suffix path
-        retriesLeft -= 1;
-        if (retriesLeft <= 0) {
-          throw new Error(`exhausted ${maxRetries} retries for nick ${opts.nick} (collision)`);
-        }
-        attemptNick = `${opts.nick}-${randomNickSuffix()}`;
-        continue;
-      }
-      throw err;
+      await access(p);
+      return true;
+    } catch {
+      return false;
     }
-  }
+  };
+  if (await exists(agentKey)) return; // already on the new name
+  if (!(await exists(legacyKey))) return; // fresh install — nothing to guard
+  throw new Error(
+    `legacy key file detected: ${legacyKey}\n` +
+      `bot-kit reads the ed25519 seed at ${agentKey}.\n` +
+      `Migrate manually:  mv ${legacyKey} ${agentKey}\n` +
+      `Or delete ${legacyKey} to mint a fresh identity (the bot DID will change).`,
+  );
 }
 
-async function waitForReady(
-  client: FreeqClient,
-  expectedNick: string,
-  expectedDid: string,
-  timeoutMs: number,
-): Promise<Connected> {
-  return new Promise<Connected>((resolve, reject) => {
-    let done = false;
-    const finish = (fn: () => void): void => {
-      if (done) return;
-      done = true;
-      cleanup();
-      fn();
-    };
-    const onReady = (): void => {
-      finish(() =>
-        resolve({
-          client,
-          did: expectedDid,
-          nick: client.nick || expectedNick,
-          disconnect: () => client.disconnect(),
-        }),
-      );
-    };
-    const onError = (msg: string): void => {
-      finish(() => reject(new Error(`server error: ${msg}`)));
-    };
-    const onAuthError = (msg: string): void => {
-      finish(() => reject(new Error(`SASL auth failed: ${msg}`)));
-    };
-    const onState = (state: any): void => {
-      if (state === 'disconnected') {
-        finish(() => reject(new Error('disconnected before ready')));
-      }
-    };
-    const cleanup = (): void => {
-      client.off('ready', onReady);
-      client.off('error', onError);
-      client.off('authError', onAuthError);
-      client.off('connectionStateChanged', onState);
-      clearTimeout(timer);
-    };
-    const timer = setTimeout(
-      () => finish(() => reject(new Error(`timeout waiting for ready (${timeoutMs}ms)`))),
-      timeoutMs,
-    );
-    client.on('ready', onReady);
-    client.on('error', onError);
-    client.on('authError', onAuthError);
-    client.on('connectionStateChanged', onState);
-    client.connect();
+export async function connect(opts: ConnectOptions): Promise<Connected> {
+  await guardLegacyKeyFile(opts.name);
+
+  const bot = await FreeqBot.create({
+    name: opts.name,
+    ownerDid: opts.ownerDid,
+    nick: opts.nick,
+    url: deriveUrl(opts),
+    channels: opts.channels,
+    onNickCollision: opts.onNickCollision,
+    heartbeatMs: opts.heartbeatMs,
+    initialState: opts.initialPresence ?? 'online',
+    ...(opts.mentionMatcher
+      ? { mention: { matcher: opts.mentionMatcher, cooldownMs: 0 } }
+      : {}),
   });
+
+  await bot.start({ timeoutMs: opts.readyTimeoutMs ?? DEFAULT_TIMEOUT_MS });
+
+  return {
+    client: bot.client,
+    identity: bot.identity,
+    delegation: bot.delegation,
+    did: bot.identity.did,
+    nick: bot.client.nick || opts.nick,
+    stop: (reason?: string) => bot.stop(reason ?? 'swarm stop'),
+    resolveSenderDid: (msg) => bot.resolveSenderDid(msg),
+    checkMention: (channel, text) => bot.checkMention(channel, text),
+  };
 }

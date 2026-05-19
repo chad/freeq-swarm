@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { handleDiscoveryRequest, parseDiscoveryResponse } from './discovery.js';
-import { createDidCache } from '@freeq-swarm/shared';
+import { createDidCache, operatorAllowlistFromDids } from '@freeq-swarm/shared';
 
 const CFG: any = {
   swarm: {
@@ -24,7 +24,7 @@ const CFG: any = {
   summary: { default_tz: 'UTC', default_time: '09:00', per_requester_tz: {} },
 };
 
-function makeDeps() {
+async function makeDeps() {
   const sentLines: string[] = [];
   const client: any = { raw: (l: string) => sentLines.push(l) };
   const didCache = createDidCache({ whois: () => {}, onMemberDid: () => () => {} });
@@ -35,14 +35,15 @@ function makeDeps() {
       config: CFG,
       coordinatorDid: 'did:key:zCoord',
       didCache,
+      operatorAllowlist: await operatorAllowlistFromDids(CFG.operator_allowlist),
       description: 'Open-source PR review swarm for the freeq project',
     },
   };
 }
 
-describe('discovery', () => {
-  it('responds to "whoareyou" DM with a swarm.discovery/v1 payload', () => {
-    const t = makeDeps();
+describe('discovery', async () => {
+  it('responds to "whoareyou" DM with a swarm.discovery/v1 payload', async () => {
+    const t = await makeDeps();
     handleDiscoveryRequest(t.deps, { target: 'swarm', from: 'newcomer', text: 'whoareyou' });
     expect(t.sentLines).toHaveLength(1);
     const parsed = parseDiscoveryResponse(t.sentLines[0]!);
@@ -56,28 +57,28 @@ describe('discovery', () => {
     expect(parsed!.operator_allowlist_hint).toContain('did:plc:contributor1');
   });
 
-  it('accepts case-insensitive trigger + aliases', () => {
-    const t = makeDeps();
+  it('accepts case-insensitive trigger + aliases', async () => {
+    const t = await makeDeps();
     handleDiscoveryRequest(t.deps, { target: 'swarm', from: 'a', text: 'WAI' });
     handleDiscoveryRequest(t.deps, { target: 'swarm', from: 'b', text: '  describe  ' });
     expect(t.sentLines).toHaveLength(2);
   });
 
-  it('ignores non-trigger DMs', () => {
-    const t = makeDeps();
+  it('ignores non-trigger DMs', async () => {
+    const t = await makeDeps();
     handleDiscoveryRequest(t.deps, { target: 'swarm', from: 'a', text: 'hi' });
     handleDiscoveryRequest(t.deps, { target: 'swarm', from: 'a', text: 'whoareyou now' });
     expect(t.sentLines).toHaveLength(0);
   });
 
-  it('ignores DMs not addressed to coordinator nick', () => {
-    const t = makeDeps();
+  it('ignores DMs not addressed to coordinator nick', async () => {
+    const t = await makeDeps();
     handleDiscoveryRequest(t.deps, { target: 'someone-else', from: 'a', text: 'whoareyou' });
     expect(t.sentLines).toHaveLength(0);
   });
 
-  it('strips CRLF from sender nick to defend against injection', () => {
-    const t = makeDeps();
+  it('strips CRLF from sender nick to defend against injection', async () => {
+    const t = await makeDeps();
     handleDiscoveryRequest(t.deps, { target: 'swarm', from: 'a\r\nKICK #x v', text: 'whoareyou' });
     for (const l of t.sentLines) {
       expect(l.indexOf('\r')).toBe(-1);
@@ -85,7 +86,7 @@ describe('discovery', () => {
     }
   });
 
-  it('parseDiscoveryResponse returns null for non-discovery PRIVMSGs', () => {
+  it('parseDiscoveryResponse returns null for non-discovery PRIVMSGs', async () => {
     expect(parseDiscoveryResponse('PRIVMSG x :hi')).toBeNull();
     expect(parseDiscoveryResponse('@msgid=01 PRIVMSG x :hi')).toBeNull();
   });

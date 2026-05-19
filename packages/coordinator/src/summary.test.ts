@@ -6,7 +6,7 @@ import {
   renderSummaryLines,
   startSummaryScheduler,
 } from './summary.js';
-import { createDidCache } from '@freeq-swarm/shared';
+import { createDidCache, operatorAllowlistFromDids } from '@freeq-swarm/shared';
 
 describe('buildStats', () => {
   it('empty tasks → zero stats', () => {
@@ -131,6 +131,7 @@ describe('startSummaryScheduler', () => {
         summary: { default_tz: 'UTC', default_time: '09:00', per_requester_tz: {} },
       } as any,
       didCache,
+      operatorAllowlist: await operatorAllowlistFromDids(['did:plc:alice']),
       scheduler: fakeSched,
     });
     await h.sendNow('did:plc:alice');
@@ -161,6 +162,7 @@ describe('startSummaryScheduler', () => {
         summary: { default_tz: 'UTC', default_time: '09:00', per_requester_tz: {} },
       } as any,
       didCache,
+      operatorAllowlist: await operatorAllowlistFromDids(['did:plc:alice']),
       scheduler: { setTimeout: (() => 0) as any, clearTimeout: (() => {}) as any },
     });
     await h.sendNow('did:plc:alice'); // no nick known
